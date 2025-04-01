@@ -1,0 +1,15 @@
+name: geo-cog-server
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.9
+  - flask=2.2.5
+  - requests=2.29.0
+  - rasterio=1.3.6
+  - pyproj=3.5.0
+  - numpy=1.24.3
+  - gdal=3.6.2
+  - shapely=2.0.1
+  - matplotlib=3.7.1
+  - pip=23.1.2

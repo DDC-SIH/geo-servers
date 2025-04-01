@@ -1,0 +1,7 @@
+myenv
+get_bounds.py
+test_cog.py
+IMG_SWIR_wgs84_cog.tif
+output_single_band.tiff
+output_single_band.png
+requirements.txt
