@@ -20,114 +20,66 @@ app = Flask(__name__)
 @app.route('/stack-layers', methods=['POST'])
 def stack_layers():
     """
-    Stack multiple layers based on z-index with transparency.
-    
-    Expected JSON input:
-    [
-        {
-            "id": "layer_id",
-            "layerType": "RGB",
-            "bandNames": ["band1", "band2", "band3"],
-            "bandIDs": ["1", "2", "3"],
-            "minMax": [
-                {"min": 0, "max": 1000, "minLim": 0, "maxLim": 1000},
-                {"min": 0, "max": 1000, "minLim": 0, "maxLim": 1000},
-                {"min": 0, "max": 1000, "minLim": 0, "maxLim": 1000}
-            ],
-            "url": "path_to_cog_file.tif",
-            "transparency": 1.0,
-            "zIndex": 1000,
-            "directURL": "http://titiler_url/cog/bbox/minx,miny,maxx,maxy.tif?parameters"
-        },
-        ...
-    ]
+    Stack multiple layers based on z-index using only directURL (TiTiler).
+    Expected input is a list of layers with valid 'directURL'.
     """
     try:
-        # Get the layers from the request
         layers = request.json
-        
         if not layers or not isinstance(layers, list):
             return jsonify({"error": "Invalid input. Expected a list of layers."}), 400
-        
-        # Optional query parameters
+
         output_format = request.args.get('format', 'tiff').lower()
-        
-        # Create a temporary directory to store files
         temp_dir = tempfile.mkdtemp()
-        
-        # Choose file extension based on format
-        if output_format == 'png':
-            file_ext = 'png'
-        else:
-            file_ext = 'tiff'
-            output_format = 'tiff'  # Default to tiff if not png
-            
+
+        file_ext = 'png' if output_format == 'png' else 'tiff'
         output_path = os.path.join(temp_dir, f"stacked_output.{file_ext}")
         temp_tiff_path = os.path.join(temp_dir, "stacked_output_temp.tiff")
-        
-        # Sort layers by zIndex, highest zIndex on top
+
+        # Sort by zIndex (lower on bottom, higher on top)
         sorted_layers = sorted(layers, key=lambda x: x.get('zIndex', 0))
-        
-        # Process each layer and prepare for stacking
+
         processed_layers = []
         reference_transform = None
         reference_crs = None
         reference_width = None
         reference_height = None
-        bounding_box = None
-        
+
         for layer in sorted_layers:
             try:
-                # Extract layer properties
                 layer_id = layer.get('id', 'unknown')
-                layer_url = layer.get('url', '')
-                direct_url = layer.get('directURL', '')
+                direct_url = layer.get('directURL')
                 transparency = float(layer.get('transparency', 1.0))
-                min_max_values = layer.get('minMax', [])
-                band_ids = layer.get('bandIDs', [])
-                
-                # Extract AOI from directURL if available
-                aoi = extract_bbox_from_url(direct_url)
-                
-                # Process the layer
+
+                if not direct_url or '/cog/bbox/' not in direct_url:
+                    raise ValueError(f"Invalid or missing directURL for layer '{layer_id}'")
+
+                # Output file for this layer
                 layer_file = os.path.join(temp_dir, f"layer_{layer_id}.tiff")
-                
-                # Process the layer based on the URL and directURL
-                process_layer(
-                    layer_url, 
-                    direct_url, 
-                    aoi, 
-                    layer_file, 
-                    band_ids, 
-                    min_max_values
-                )
-                
-                # Read the processed layer
+
+                # Download and save the raster
+                download_from_titiler(direct_url, layer_file)
+
                 with rasterio.open(layer_file) as src:
-                    # If this is the first layer, use it as reference
                     if reference_transform is None:
                         reference_transform = src.transform
                         reference_crs = src.crs
                         reference_width = src.width
                         reference_height = src.height
-                        bounding_box = src.bounds
-                    
-                    # Add to processed layers
-                    processed_layers.append({
-                        'file': layer_file,
-                        'transparency': transparency
-                    })
-                    
-                print(f"Processed layer {layer_id}")
-                
+
+                processed_layers.append({
+                    'file': layer_file,
+                    'transparency': transparency
+                })
+
+                print(f"Processed {layer_id} from directURL")
+
             except Exception as e:
-                print(f"Error processing layer {layer.get('id', 'unknown')}: {str(e)}")
+                print(f"Error processing layer {layer.get('id', 'unknown')}: {e}")
                 continue
-        
+
         if not processed_layers:
             return jsonify({"error": "No layers could be processed."}), 400
-        
-        # Stack the layers
+
         stack_result = stack_layers_with_transparency(
             processed_layers,
             temp_tiff_path,
@@ -136,25 +88,21 @@ def stack_layers():
             reference_width,
             reference_height
         )
-        
+
         if not stack_result:
             return jsonify({"error": "Failed to stack layers."}), 500
-        
-        # Convert to PNG if requested
+
         if output_format == 'png':
             convert_tiff_to_png(temp_tiff_path, output_path)
         else:
-            # Just copy the temporary TIFF to the output path
             shutil.copy(temp_tiff_path, output_path)
-        
-        # Return the file to the user
+
         return send_file(output_path, as_attachment=True, download_name=f"stacked_layers.{file_ext}")
-    
+
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-    
+
     finally:
-        # Clean up temporary files
         if 'temp_dir' in locals():
             shutil.rmtree(temp_dir, ignore_errors=True)
 
