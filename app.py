@@ -192,44 +192,53 @@ def extract_bbox_from_url(url):
     return None
 
 def process_layer(file_url, direct_url, aoi, output_path, band_ids=None, min_max_values=None):
-    """Process a layer based on its URL and direct URL."""
+    """Process a layer based on DirectURL or local file URL."""
     try:
-        # If we have a directURL with a bounding box, use that instead of processing the full file
-        if direct_url and ('/cog/bbox/' in direct_url):
-            # Extract bbox from directURL
-            bbox_match = re.search(r'/bbox/([^.]+)', direct_url)
-            if bbox_match:
-                bbox_str = bbox_match.group(1)
-                bbox = [float(coord) for coord in bbox_str.split(',')]
-                
-                # Download from TiTiler with the correct bbox
+        # Prioritize DirectURL from TiTiler if available
+        if direct_url:
+            try:
+                print(f"Using DirectURL from TiTiler: {direct_url}")
+                # Download pre-processed data from TiTiler
                 download_from_titiler(direct_url, output_path)
                 return
+            except Exception as e:
+                print(f"Error downloading from TiTiler DirectURL: {str(e)}. Trying local file.")
         
-        # Fallback to local file processing if no directURL or bbox
-        is_local_file = os.path.exists(file_url) or (
-            urlparse(file_url).scheme == 'file' or 
-            urlparse(file_url).scheme == ''
-        )
+        # Fallback to local file processing if DirectURL fails or is not provided
+        if file_url:
+            try:
+                # Check if it's a local file or a URL
+                if os.path.exists(file_url):
+                    print(f"Processing local file: {file_url}")
+                    process_local_file(file_url, output_path, aoi, band_ids, min_max_values)
+                else:
+                    # It's a URL, download it first
+                    print(f"Downloading file from URL: {file_url}")
+                    temp_file = output_path + "_download.tif"
+                    download_file(file_url, temp_file)
+                    process_local_file(temp_file, output_path, aoi, band_ids, min_max_values)
+                    # Clean up temporary file
+                    if os.path.exists(temp_file):
+                        os.remove(temp_file)
+                return
+            except Exception as e:
+                print(f"Error processing local file: {str(e)}")
         
-        if is_local_file:
-            local_path = file_url
-            if urlparse(file_url).scheme == 'file':
-                local_path = urlparse(file_url).path
-                if os.name == 'nt' and local_path.startswith('/'):
-                    local_path = local_path[1:]
-            
-            process_local_file(local_path, output_path, aoi, band_ids, min_max_values)
-        else:
-            temp_file = output_path + ".temp"
-            download_file(file_url, temp_file)
-            process_local_file(temp_file, output_path, aoi, band_ids, min_max_values)
-            if os.path.exists(temp_file):
-                os.remove(temp_file)
-    
+        # If we get here, neither option worked
+        raise ValueError("Failed to process layer: No valid DirectURL or local file URL provided")
+        
     except Exception as e:
         print(f"Error processing layer: {str(e)}")
         raise
+
+def parse_direct_url(direct_url):
+    """Parse TiTiler URL to extract parameters."""
+    if not direct_url:
+        return None
+    
+    # The URL already contains all necessary parameters
+    # Just return it as is
+    return direct_url
 
 def process_local_file(file_path, output_path, aoi=None, band_ids=None, min_max_values=None):
     """Process a local file with the given parameters."""
@@ -345,6 +354,14 @@ def download_from_titiler(titiler_url, output_path):
     with open(output_path, 'wb') as f:
         for chunk in response.iter_content(chunk_size=8192):
             f.write(chunk)
+    
+    # Verify the downloaded file is valid
+    try:
+        with rasterio.open(output_path) as src:
+            if src.count == 0:
+                raise ValueError("Downloaded file has no valid bands")
+    except Exception as e:
+        raise ValueError(f"Downloaded file is not a valid raster: {str(e)}")
 
 def download_file(url, output_path):
     """Download a file from a URL."""
@@ -358,45 +375,50 @@ def download_file(url, output_path):
 
 def stack_layers_with_transparency(layers, output_path, transform, crs, width, height):
     """Stack multiple layers with transparency using vectorized operations."""
-    # Create a blank canvas with alpha channel (RGBA)
+    # Initialize an empty RGBA image
     stacked_data = np.zeros((height, width, 4), dtype=np.uint8)
     
     try:
-        # Process layers from bottom to top
         for layer_info in layers:
             layer_file = layer_info['file']
             transparency = layer_info['transparency']
             
+            # Skip layer completely if transparency is 0
+            if transparency <= 0:
+                print(f"Skipping layer with transparency {transparency}")
+                continue
+                
+            print(f"Processing layer with transparency {transparency}")
+            
+            # Read the layer data
             with rasterio.open(layer_file) as src:
-                # Reproject if needed
+                # Handle reprojection if needed
                 if src.transform != transform or src.crs != crs or src.width != width or src.height != height:
-                    # Reproject to match reference
-                    with rasterio.open(layer_file) as src:
-                        # Read source data
-                        if src.count == 1:
-                            data = src.read(1)
-                            rgb_data = np.stack([data, data, data])
-                        elif src.count >= 3:
-                            rgb_data = src.read([1, 2, 3])
-                        else:
-                            data = src.read(1)
-                            rgb_data = np.stack([data, data, data])
-                        
-                        # Prepare destination array
-                        dest_data = np.zeros((3, height, width), dtype=rgb_data.dtype)
-                        
-                        # Reproject
-                        reproject(
-                            rgb_data, dest_data,
-                            src_transform=src.transform,
-                            src_crs=src.crs,
-                            dst_transform=transform,
-                            dst_crs=crs,
-                            resampling=Resampling.bilinear
-                        )
-                        
-                        # Convert to image format (H, W, C)
-                        layer_rgb = reshape_as_image(dest_data)
+                    # Read and reproject data
+                    if src.count == 1:
+                        data = src.read(1)
+                        rgb_data = np.stack([data, data, data])
+                    elif src.count >= 3:
+                        rgb_data = src.read([1, 2, 3])
+                    else:
+                        data = src.read(1)
+                        rgb_data = np.stack([data, data, data])
+                    
+                    # Prepare destination array
+                    dest_data = np.zeros((3, height, width), dtype=rgb_data.dtype)
+                    
+                    # Reproject
+                    reproject(
+                        rgb_data, dest_data,
+                        src_transform=src.transform,
+                        src_crs=src.crs,
+                        dst_transform=transform,
+                        dst_crs=crs,
+                        resampling=Resampling.bilinear
+                    )
+                    
+                    # Convert to image format (H, W, C)
+                    layer_rgb = reshape_as_image(dest_data)
                 else:
                     # No reprojection needed
                     if src.count == 1:
@@ -416,34 +438,45 @@ def stack_layers_with_transparency(layers, output_path, transform, crs, width, h
                     else:
                         layer_rgb = layer_rgb.astype(np.uint8)
                 
-                # Create alpha channel (fully opaque)
-                alpha = np.ones((height, width), dtype=np.uint8) * 255
-                alpha = (alpha * transparency).astype(np.uint8)
+                # Create a new RGBA image for this layer
+                layer_rgba = np.dstack([
+                    layer_rgb, 
+                    np.ones((height, width), dtype=np.uint8) * int(255 * transparency)
+                ])
                 
-                # Vectorized alpha blending
-                # Convert alpha to float for calculations
-                src_alpha = alpha.astype(float) / 255.0
-                dst_alpha = stacked_data[..., 3].astype(float) / 255.0
+                # Perform alpha compositing
+                # See: https://en.wikipedia.org/wiki/Alpha_compositing
                 
-                # Calculate new alpha
-                out_alpha = src_alpha + dst_alpha * (1 - src_alpha)
+                # Extract alpha values (as float 0-1)
+                src_a = layer_rgba[..., 3].astype(float) / 255.0
+                dst_a = stacked_data[..., 3].astype(float) / 255.0
                 
-                # Create mask for pixels that need blending
-                mask = out_alpha > 0
+                # Calculate output alpha
+                out_a = src_a + dst_a * (1.0 - src_a)
                 
-                # Apply blending only where needed
-                for c in range(3):  # RGB channels
-                    stacked_data[..., c] = np.where(
-                        mask,
-                        (layer_rgb[..., c] * src_alpha + 
-                         stacked_data[..., c] * dst_alpha * (1 - src_alpha)) / out_alpha,
-                        stacked_data[..., c]
-                    ).astype(np.uint8)
+                # Calculate blended RGB values
+                for i in range(3):  # RGB channels
+                    src_c = layer_rgba[..., i].astype(float) / 255.0
+                    dst_c = stacked_data[..., i].astype(float) / 255.0
+                    
+                    # Avoid division by zero
+                    safe_out_a = np.maximum(out_a, 0.0001)
+                    
+                    # Compute blended color
+                    blended = (src_c * src_a + dst_c * dst_a * (1.0 - src_a)) / safe_out_a
+                    
+                    # Update only where there's some output alpha
+                    update_mask = out_a > 0
+                    stacked_data[..., i] = np.where(
+                        update_mask,
+                        np.clip(blended * 255, 0, 255).astype(np.uint8),
+                        stacked_data[..., i]
+                    )
                 
                 # Update alpha channel
-                stacked_data[..., 3] = (out_alpha * 255).astype(np.uint8)
+                stacked_data[..., 3] = np.clip(out_a * 255, 0, 255).astype(np.uint8)
         
-        # Write the stacked image to a GeoTIFF
+        # Write the stacked image to a GeoTIFF (RGB only)
         rgb_data = stacked_data[..., :3].transpose(2, 0, 1)
         
         with rasterio.open(
@@ -459,10 +492,13 @@ def stack_layers_with_transparency(layers, output_path, transform, crs, width, h
         ) as dst:
             dst.write(rgb_data)
         
+        print(f"Successfully wrote stacked image to {output_path}")
         return True
     
     except Exception as e:
         print(f"Error stacking layers: {str(e)}")
+        import traceback
+        traceback.print_exc()
         return False
 
 def convert_tiff_to_png(tiff_path, png_path):
@@ -486,4 +522,4 @@ def convert_tiff_to_png(tiff_path, png_path):
             plt.imsave(png_path, data, cmap='gray')
 
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=5000) 
+    app.run(debug=True, host='0.0.0.0', port=5000)
