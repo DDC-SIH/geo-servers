@@ -2,6 +2,7 @@ import os
 import json
 import tempfile
 import shutil
+import logging
 from urllib.parse import urlparse, parse_qs, unquote
 import requests
 import numpy as np
@@ -15,6 +16,11 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import Normalize
 import re
 
+# Configure logging
+logging.basicConfig(level=logging.DEBUG, 
+                   format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
 app = Flask(__name__)
 
 @app.route('/stack-layers', methods=['POST'])
@@ -22,19 +28,9 @@ def stack_layers():
     """
     Stack multiple layers based on z-index with transparency.
     
-    Expected JSON input:
+    Simplified JSON input:
     [
         {
-            "id": "layer_id",
-            "layerType": "RGB",
-            "bandNames": ["band1", "band2", "band3"],
-            "bandIDs": ["1", "2", "3"],
-            "minMax": [
-                {"min": 0, "max": 1000, "minLim": 0, "maxLim": 1000},
-                {"min": 0, "max": 1000, "minLim": 0, "maxLim": 1000},
-                {"min": 0, "max": 1000, "minLim": 0, "maxLim": 1000}
-            ],
-            "url": "path_to_cog_file.tif",
             "transparency": 1.0,
             "zIndex": 1000,
             "directURL": "http://titiler_url/cog/bbox/minx,miny,maxx,maxy.tif?parameters"
@@ -54,6 +50,7 @@ def stack_layers():
         
         # Create a temporary directory to store files
         temp_dir = tempfile.mkdtemp()
+        logger.debug(f"Created temporary directory: {temp_dir}")
         
         # Choose file extension based on format
         if output_format == 'png':
@@ -67,6 +64,7 @@ def stack_layers():
         
         # Sort layers by zIndex, highest zIndex on top
         sorted_layers = sorted(layers, key=lambda x: x.get('zIndex', 0))
+        logger.debug(f"Processing {len(sorted_layers)} layers")
         
         # Process each layer and prepare for stacking
         processed_layers = []
@@ -76,56 +74,72 @@ def stack_layers():
         reference_height = None
         bounding_box = None
         
-        for layer in sorted_layers:
+        for i, layer in enumerate(sorted_layers):
             try:
                 # Extract layer properties
-                layer_id = layer.get('id', 'unknown')
-                layer_url = layer.get('url', '')
+                layer_id = layer.get('id', f"layer_{i}")
                 direct_url = layer.get('directURL', '')
                 transparency = float(layer.get('transparency', 1.0))
-                min_max_values = layer.get('minMax', [])
-                band_ids = layer.get('bandIDs', [])
                 
-                # Extract AOI from directURL if available
-                aoi = extract_bbox_from_url(direct_url)
+                # Ensure directURL is provided
+                if not direct_url:
+                    logger.warning(f"Skipping layer {layer_id}: Missing directURL.")
+                    continue
                 
-                # Process the layer
+                logger.debug(f"Processing layer {layer_id} with transparency {transparency} and zIndex {layer.get('zIndex')}")
+                
+                # Validate and extract TiTiler URL
+                validated_url, error = extract_and_validate_titiler_url(direct_url)
+                if error:
+                    logger.error(f"Invalid TiTiler URL for layer {layer_id}: {error}")
+                    continue
+                
+                # Process the layer using directURL
                 layer_file = os.path.join(temp_dir, f"layer_{layer_id}.tiff")
                 
-                # Process the layer based on the URL and directURL
-                process_layer(
-                    layer_url, 
-                    direct_url, 
-                    aoi, 
-                    layer_file, 
-                    band_ids, 
-                    min_max_values
-                )
+                # Download from TiTiler or process locally
+                download_result = download_from_titiler(validated_url, layer_file)
+                if not download_result:
+                    logger.error(f"Failed to download/process layer {layer_id}")
+                    continue
+                
+                # Verify the file exists
+                if not os.path.exists(layer_file) or os.path.getsize(layer_file) < 100:
+                    logger.error(f"Layer file is missing or too small: {layer_file}")
+                    continue
                 
                 # Read the processed layer
-                with rasterio.open(layer_file) as src:
-                    # If this is the first layer, use it as reference
-                    if reference_transform is None:
-                        reference_transform = src.transform
-                        reference_crs = src.crs
-                        reference_width = src.width
-                        reference_height = src.height
-                        bounding_box = src.bounds
-                    
-                    # Add to processed layers
-                    processed_layers.append({
-                        'file': layer_file,
-                        'transparency': transparency
-                    })
-                    
-                print(f"Processed layer {layer_id}")
+                try:
+                    with rasterio.open(layer_file) as src:
+                        # If this is the first layer, use it as reference
+                        if reference_transform is None:
+                            reference_transform = src.transform
+                            reference_crs = src.crs
+                            reference_width = src.width
+                            reference_height = src.height
+                            bounding_box = src.bounds
+                            logger.debug(f"Reference layer set: {reference_width}x{reference_height}, CRS: {reference_crs}")
+                        
+                        # Add to processed layers with transparency
+                        processed_layers.append({
+                            'file': layer_file,
+                            'transparency': transparency
+                        })
+                        
+                    logger.debug(f"Successfully processed layer {layer_id}")
+                except rasterio.errors.RasterioIOError as e:
+                    logger.error(f"Failed to open raster file for layer {layer_id}: {str(e)}")
+                    continue
                 
             except Exception as e:
-                print(f"Error processing layer {layer.get('id', 'unknown')}: {str(e)}")
+                logger.error(f"Error processing layer {layer.get('id', f'layer_{i}')}: {str(e)}", exc_info=True)
                 continue
         
         if not processed_layers:
+            logger.error("No layers could be processed.")
             return jsonify({"error": "No layers could be processed."}), 400
+        
+        logger.debug(f"Stacking {len(processed_layers)} layers")
         
         # Stack the layers
         stack_result = stack_layers_with_transparency(
@@ -138,24 +152,32 @@ def stack_layers():
         )
         
         if not stack_result:
+            logger.error("Failed to stack layers.")
             return jsonify({"error": "Failed to stack layers."}), 500
+        
+        logger.debug(f"Successfully stacked layers to {temp_tiff_path} ({os.path.getsize(temp_tiff_path)} bytes)")
         
         # Convert to PNG if requested
         if output_format == 'png':
             convert_tiff_to_png(temp_tiff_path, output_path)
+            logger.debug(f"Converted to PNG: {output_path} ({os.path.getsize(output_path)} bytes)")
         else:
             # Just copy the temporary TIFF to the output path
             shutil.copy(temp_tiff_path, output_path)
+            logger.debug(f"Copied to output: {output_path} ({os.path.getsize(output_path)} bytes)")
         
         # Return the file to the user
-        return send_file(output_path, as_attachment=True, download_name=f"stacked_layers.{file_ext}")
+        return send_file(output_path, mimetype=f'image/{file_ext}', 
+                        as_attachment=True, download_name=f"stacked_layers.{file_ext}")
     
     except Exception as e:
+        logger.error(f"General error in stack_layers: {str(e)}", exc_info=True)
         return jsonify({"error": str(e)}), 500
     
     finally:
         # Clean up temporary files
         if 'temp_dir' in locals():
+            logger.debug(f"Cleaning up temporary directory: {temp_dir}")
             shutil.rmtree(temp_dir, ignore_errors=True)
 
 def extract_bbox_from_url(url):
@@ -191,170 +213,238 @@ def extract_bbox_from_url(url):
     
     return None
 
-def process_layer(file_url, direct_url, aoi, output_path, band_ids=None, min_max_values=None):
-    """Process a layer based on its URL and direct URL."""
-    try:
-        # If we have a directURL with a bounding box, use that instead of processing the full file
-        if direct_url and ('/cog/bbox/' in direct_url):
-            # Extract bbox from directURL
-            bbox_match = re.search(r'/bbox/([^.]+)', direct_url)
-            if bbox_match:
-                bbox_str = bbox_match.group(1)
-                bbox = [float(coord) for coord in bbox_str.split(',')]
-                
-                # Download from TiTiler with the correct bbox
-                download_from_titiler(direct_url, output_path)
-                return
-        
-        # Fallback to local file processing if no directURL or bbox
-        is_local_file = os.path.exists(file_url) or (
-            urlparse(file_url).scheme == 'file' or 
-            urlparse(file_url).scheme == ''
-        )
-        
-        if is_local_file:
-            local_path = file_url
-            if urlparse(file_url).scheme == 'file':
-                local_path = urlparse(file_url).path
-                if os.name == 'nt' and local_path.startswith('/'):
-                    local_path = local_path[1:]
-            
-            process_local_file(local_path, output_path, aoi, band_ids, min_max_values)
-        else:
-            temp_file = output_path + ".temp"
-            download_file(file_url, temp_file)
-            process_local_file(temp_file, output_path, aoi, band_ids, min_max_values)
-            if os.path.exists(temp_file):
-                os.remove(temp_file)
+def extract_and_validate_titiler_url(direct_url):
+    """
+    Extracts and validates the TiTiler URL, ensuring it has the correct parameters.
+    Also extracts file path and parameters for direct processing.
     
-    except Exception as e:
-        print(f"Error processing layer: {str(e)}")
-        raise
-
-def process_local_file(file_path, output_path, aoi=None, band_ids=None, min_max_values=None):
-    """Process a local file with the given parameters."""
-    with rasterio.open(file_path) as src:
-        # Determine which bands to use
-        if band_ids and all(band_id.isdigit() for band_id in band_ids):
-            bands_to_read = [int(band_id) for band_id in band_ids]
-            # Ensure bands are within range
-            bands_to_read = [b for b in bands_to_read if b <= src.count and b > 0]
-        else:
-            # Default to first 3 bands for RGB or first band for single band
-            bands_to_read = list(range(1, min(4, src.count + 1)))
+    Returns:
+        tuple: (valid_url, error_message)
+    """
+    try:
+        # Handle URL-encoded parameters
+        decoded_url = unquote(direct_url)
         
-        # If no valid bands, use the first band
-        if not bands_to_read:
-            bands_to_read = [1]
+        # Parse the URL
+        parsed_url = urlparse(decoded_url)
+        query_params = parse_qs(parsed_url.query)
         
-        # Process AOI if provided
-        if aoi and len(aoi) == 4:
+        # Check for the source URL parameter
+        if 'url' not in query_params:
+            return None, "Missing 'url' parameter in TiTiler URL"
+        
+        # For debugging, show all parameters
+        logger.debug(f"TiTiler URL parameters: {query_params}")
+        
+        # Extract file path and other parameters for direct processing
+        local_file_path = unquote(query_params['url'][0])
+        band_indices = [int(b) for b in query_params.get('bidx', [])] if 'bidx' in query_params else None
+        rescale_values = query_params.get('rescale', [])
+        
+        # Store these in flask.g for later use if TiTiler is unavailable
+        from flask import g
+        g.local_file_path = local_file_path
+        g.band_indices = band_indices
+        g.rescale_values = rescale_values
+        
+        # Extract bbox from URL path
+        bbox_pattern = r'/bbox/([^.]+)'
+        match = re.search(bbox_pattern, decoded_url)
+        if match:
+            bbox_str = match.group(1)
             try:
-                # Get window from bounds
-                window = from_bounds(aoi[0], aoi[1], aoi[2], aoi[3], src.transform)
-                
-                # Read data for each band
-                bands_data = []
-                for i, band in enumerate(bands_to_read):
-                    data = src.read(band, window=window)
-                    
-                    # Apply min/max rescaling if provided
-                    if min_max_values and i < len(min_max_values):
-                        min_val = min_max_values[i].get('min', 0)
-                        max_val = min_max_values[i].get('max', 1000)
-                        
-                        # Rescale
-                        data = np.clip(data, min_val, max_val)
-                        data = (data - min_val) / (max_val - min_val) * 255
-                        data = data.astype(np.uint8)
-                    
-                    bands_data.append(data)
-                
-                # Update metadata for output
-                out_meta = src.meta.copy()
-                out_meta.update({
-                    'count': len(bands_data),
-                    'width': bands_data[0].shape[1],
-                    'height': bands_data[0].shape[0],
-                    'transform': rasterio.windows.transform(window, src.transform)
-                })
-                
-            except Exception as e:
-                print(f"Error processing AOI: {str(e)}. Using full extent.")
-                # Fallback to reading the full image
-                bands_data = []
-                for i, band in enumerate(bands_to_read):
-                    data = src.read(band)
-                    
-                    # Apply min/max rescaling if provided
-                    if min_max_values and i < len(min_max_values):
-                        min_val = min_max_values[i].get('min', 0)
-                        max_val = min_max_values[i].get('max', 1000)
-                        
-                        # Rescale
-                        data = np.clip(data, min_val, max_val)
-                        data = (data - min_val) / (max_val - min_val) * 255
-                        data = data.astype(np.uint8)
-                    
-                    bands_data.append(data)
-                
-                # Use original metadata
-                out_meta = src.meta.copy()
-                out_meta.update({
-                    'count': len(bands_data),
-                })
+                g.bbox = [float(coord) for coord in bbox_str.split(',')]
+            except:
+                g.bbox = None
         else:
-            # No AOI, read full image
-            bands_data = []
-            for i, band in enumerate(bands_to_read):
-                data = src.read(band)
-                
-                # Apply min/max rescaling if provided
-                if min_max_values and i < len(min_max_values):
-                    min_val = min_max_values[i].get('min', 0)
-                    max_val = min_max_values[i].get('max', 1000)
-                    
-                    # Rescale
-                    data = np.clip(data, min_val, max_val)
-                    data = (data - min_val) / (max_val - min_val) * 255
-                    data = data.astype(np.uint8)
-                
-                bands_data.append(data)
-            
-            # Use original metadata
-            out_meta = src.meta.copy()
-            out_meta.update({
-                'count': len(bands_data),
-            })
+            g.bbox = None
         
-        # Write the processed data to output file
-        with rasterio.open(output_path, 'w', **out_meta) as dst:
-            for i, data in enumerate(bands_data, 1):
-                dst.write(data, i)
+        # Ensure bidx parameters are present if needed
+        if 'bidx' not in query_params:
+            logger.warning("No 'bidx' parameters in TiTiler URL")
+        
+        # Construct a valid URL if needed
+        # This ensures we're getting a valid TiFF output
+        if not decoded_url.endswith('.tif'):
+            base_url = direct_url.split('?')[0]
+            if not base_url.endswith('.tif'):
+                base_url += '.tif'
+            
+            # Reconstruct URL with query parameters
+            query_string = '&'.join([f"{k}={v}" for k, v in query_params.items() for v in query_params[k]])
+            valid_url = f"{base_url}?{query_string}"
+            logger.debug(f"Reconstructed URL: {valid_url}")
+            return valid_url, None
+        
+        return decoded_url, None
+        
+    except Exception as e:
+        return None, f"Error validating TiTiler URL: {str(e)}"
+
+def process_local_file(file_path, output_path, bbox=None, band_indices=None, rescale_values=None):
+    """Process local file directly when TiTiler is unavailable."""
+    logger.info(f"Processing local file directly: {file_path}")
+    try:
+        if not os.path.exists(file_path):
+            logger.error(f"Local file not found: {file_path}")
+            return False
+            
+        with rasterio.open(file_path) as src:
+            # Determine which bands to use
+            if band_indices and all(1 <= b <= src.count for b in band_indices):
+                bands_to_read = band_indices
+            else:
+                # Default to first 3 bands for RGB or first band for grayscale
+                bands_to_read = list(range(1, min(4, src.count + 1)))
+                
+            logger.debug(f"Reading bands: {bands_to_read}")
+            
+            # Process AOI if provided
+            if bbox and len(bbox) == 4:
+                try:
+                    # Get window from bounds
+                    window = from_bounds(bbox[0], bbox[1], bbox[2], bbox[3], src.transform)
+                    
+                    # Read data for each band
+                    bands_data = []
+                    for i, band in enumerate(bands_to_read):
+                        data = src.read(band, window=window)
+                        
+                        # Apply rescaling if provided
+                        if rescale_values and i < len(rescale_values):
+                            try:
+                                min_val, max_val = map(float, rescale_values[i].split(','))
+                                data = np.clip(data, min_val, max_val)
+                                data = ((data - min_val) / (max_val - min_val) * 255).astype(np.uint8)
+                            except Exception as e:
+                                logger.warning(f"Error applying rescale for band {band}: {str(e)}")
+                        
+                        bands_data.append(data)
+                    
+                    # Update metadata for output
+                    out_meta = src.meta.copy()
+                    out_meta.update({
+                        'count': len(bands_data),
+                        'width': bands_data[0].shape[1],
+                        'height': bands_data[0].shape[0],
+                        'transform': rasterio.windows.transform(window, src.transform)
+                    })
+                    
+                except Exception as e:
+                    logger.warning(f"Error processing AOI: {str(e)}. Using full extent.")
+                    # Fallback to reading the full image
+                    bands_data, out_meta = read_full_image(src, bands_to_read, rescale_values)
+            else:
+                # No AOI, read full image
+                bands_data, out_meta = read_full_image(src, bands_to_read, rescale_values)
+            
+            # Write the processed data to output file
+            with rasterio.open(output_path, 'w', **out_meta) as dst:
+                for i, data in enumerate(bands_data, 1):
+                    dst.write(data, i)
+                    
+            logger.info(f"Successfully processed local file to {output_path}")
+            return True
+            
+    except Exception as e:
+        logger.error(f"Error processing local file: {str(e)}", exc_info=True)
+        return False
+
+def read_full_image(src, bands_to_read, rescale_values=None):
+    """Helper function to read full image data."""
+    bands_data = []
+    for i, band in enumerate(bands_to_read):
+        data = src.read(band)
+        
+        # Apply rescaling if provided
+        if rescale_values and i < len(rescale_values):
+            try:
+                min_val, max_val = map(float, rescale_values[i].split(','))
+                data = np.clip(data, min_val, max_val)
+                data = ((data - min_val) / (max_val - min_val) * 255).astype(np.uint8)
+            except Exception as e:
+                logger.warning(f"Error applying rescale for band {band}: {str(e)}")
+        
+        bands_data.append(data)
+    
+    # Use original metadata with updated count
+    out_meta = src.meta.copy()
+    out_meta.update({
+        'count': len(bands_data),
+    })
+    
+    return bands_data, out_meta
 
 def download_from_titiler(titiler_url, output_path):
     """Download a COG from TiTiler."""
-    # Handle URL-encoded parameters
-    decoded_url = unquote(titiler_url)
-    
-    # Download the image
-    response = requests.get(decoded_url, stream=True)
-    if response.status_code != 200:
-        raise Exception(f"Failed to download from TiTiler: {response.status_code} - {response.text}")
-    
-    with open(output_path, 'wb') as f:
-        for chunk in response.iter_content(chunk_size=8192):
-            f.write(chunk)
-
-def download_file(url, output_path):
-    """Download a file from a URL."""
-    response = requests.get(url, stream=True)
-    if response.status_code != 200:
-        raise Exception(f"Failed to download file: {response.status_code} - {response.text}")
-    
-    with open(output_path, 'wb') as f:
-        for chunk in response.iter_content(chunk_size=8192):
-            f.write(chunk)
+    try:
+        # Handle URL-encoded parameters
+        decoded_url = unquote(titiler_url)
+        logger.debug(f"Downloading from URL: {decoded_url}")
+        
+        try:
+            # Try to download from TiTiler
+            response = requests.get(decoded_url, stream=True, timeout=5)
+            if response.status_code != 200:
+                logger.warning(f"Failed to download from TiTiler: {response.status_code} - {response.text}")
+                # Fall back to direct file processing
+                from flask import g
+                if hasattr(g, 'local_file_path'):
+                    logger.info(f"Falling back to direct file processing")
+                    return process_local_file(
+                        g.local_file_path, 
+                        output_path, 
+                        bbox=getattr(g, 'bbox', None),
+                        band_indices=getattr(g, 'band_indices', None),
+                        rescale_values=getattr(g, 'rescale_values', None)
+                    )
+                return False
+            
+            # Write response to file
+            with open(output_path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:  # filter out keep-alive chunks
+                        f.write(chunk)
+            
+            if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+                logger.debug(f"Successfully downloaded from TiTiler to {output_path}")
+                return True
+            else:
+                logger.warning(f"Download seemed successful but file is empty: {output_path}")
+                # Fall back to direct file processing
+                from flask import g
+                if hasattr(g, 'local_file_path'):
+                    logger.info(f"Falling back to direct file processing")
+                    return process_local_file(
+                        g.local_file_path, 
+                        output_path, 
+                        bbox=getattr(g, 'bbox', None),
+                        band_indices=getattr(g, 'band_indices', None),
+                        rescale_values=getattr(g, 'rescale_values', None)
+                    )
+                return False
+                
+        except requests.exceptions.RequestException as e:
+            logger.warning(f"TiTiler connection failed: {str(e)}")
+            
+            # Fall back to direct file processing
+            from flask import g
+            if hasattr(g, 'local_file_path'):
+                logger.info(f"Falling back to direct file processing")
+                return process_local_file(
+                    g.local_file_path, 
+                    output_path, 
+                    bbox=getattr(g, 'bbox', None),
+                    band_indices=getattr(g, 'band_indices', None),
+                    rescale_values=getattr(g, 'rescale_values', None)
+                )
+            else:
+                logger.error("No local file path available for fallback processing")
+                return False
+        
+    except Exception as e:
+        logger.error(f"Error in download_from_titiler: {str(e)}", exc_info=True)
+        return False
 
 def stack_layers_with_transparency(layers, output_path, transform, crs, width, height):
     """Stack multiple layers with transparency using vectorized operations."""
@@ -462,7 +552,7 @@ def stack_layers_with_transparency(layers, output_path, transform, crs, width, h
         return True
     
     except Exception as e:
-        print(f"Error stacking layers: {str(e)}")
+        logger.error(f"Error stacking layers: {str(e)}", exc_info=True)
         return False
 
 def convert_tiff_to_png(tiff_path, png_path):
@@ -486,4 +576,4 @@ def convert_tiff_to_png(tiff_path, png_path):
             plt.imsave(png_path, data, cmap='gray')
 
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=5000) 
+    app.run(debug=True, host='0.0.0.0', port=5000)
