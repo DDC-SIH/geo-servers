@@ -15,6 +15,8 @@ from shapely.geometry import shape, box
 import matplotlib.pyplot as plt
 from matplotlib.colors import Normalize
 import re
+import zipfile
+from io import BytesIO
 
 # Configure logging
 logging.basicConfig(level=logging.DEBUG, 
@@ -47,6 +49,7 @@ def stack_layers():
         
         # Optional query parameters
         output_format = request.args.get('format', 'tiff').lower()
+        create_zip = request.args.get('zip', 'no').lower() == 'yes'
         
         # Create a temporary directory to store files
         temp_dir = tempfile.mkdtemp()
@@ -123,7 +126,8 @@ def stack_layers():
                         # Add to processed layers with transparency
                         processed_layers.append({
                             'file': layer_file,
-                            'transparency': transparency
+                            'transparency': transparency,
+                            'id': layer_id
                         })
                         
                     logger.debug(f"Successfully processed layer {layer_id}")
@@ -166,9 +170,27 @@ def stack_layers():
             shutil.copy(temp_tiff_path, output_path)
             logger.debug(f"Copied to output: {output_path} ({os.path.getsize(output_path)} bytes)")
         
-        # Return the file to the user
-        return send_file(output_path, mimetype=f'image/{file_ext}', 
-                        as_attachment=True, download_name=f"stacked_layers.{file_ext}")
+        # If zip is requested, create a zip with all layers and result
+        if create_zip:
+            logger.debug("Creating ZIP file with all layers and result")
+            zip_path = os.path.join(temp_dir, "stacked_layers_package.zip")
+            
+            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                # Add the stacked result
+                zipf.write(output_path, os.path.basename(output_path))
+                
+                # Add all the individual layers
+                for layer in processed_layers:
+                    layer_filename = os.path.basename(layer['file'])
+                    zipf.write(layer['file'], f"raw_layers/{layer['id']}_{layer_filename}")
+            
+            logger.debug(f"Created ZIP file: {zip_path} ({os.path.getsize(zip_path)} bytes)")
+            return send_file(zip_path, mimetype='application/zip',
+                           as_attachment=True, download_name="stacked_layers_package.zip")
+        else:
+            # Return just the stacked file to the user
+            return send_file(output_path, mimetype=f'image/{file_ext}', 
+                            as_attachment=True, download_name=f"stacked_layers.{file_ext}")
     
     except Exception as e:
         logger.error(f"General error in stack_layers: {str(e)}", exc_info=True)

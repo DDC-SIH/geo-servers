@@ -138,10 +138,11 @@ Each layer object in the array must contain:
 #### Optional Query Parameters
 
 - `format`: Output format (`tiff` or `png`). Defaults to `tiff` if not specified.
+- `download`: When set to `yes`, returns a zip file containing both the raw source files and the stacked result.
 
 #### Response
 
-The endpoint returns the stacked layers as a file attachment in the requested format.
+The endpoint returns the stacked layers as a file attachment in the requested format. If `download=yes` is specified, it returns a zip file containing both the raw source files and the stacked result.
 
 ## Examples
 
@@ -220,4 +221,24 @@ curl --location 'http://localhost:5000/stack-layers?format=png' \
     "directURL": "http://127.0.0.1:8000/cog/bbox/72.0254,15.7501,100.7698,34.2257.tif?url=path/to/cog.tif&bidx=1&bidx=2&bidx=4&rescale=0%2C1000&rescale=0%2C1000&rescale=0%2C1000"
   }
 ]' --output test_output.png
+```
+
+### 6. Stack Layers and Download Raw Files
+
+```bash
+curl --location 'http://localhost:5000/stack-layers?download=yes' \
+--header 'accept: application/json' \
+--header 'Content-Type: application/json' \
+--data '[
+  {
+    "transparency": 0.5,
+    "zIndex": 1000,
+    "directURL": "http://127.0.0.1:8000/cog/bbox/72.0254,15.7501,100.7698,34.2257.tif?url=path/to/cog.tif&bidx=1&bidx=3&bidx=4&rescale=0%2C1000&rescale=0%2C1000&rescale=0%2C1000"
+  },
+  {
+    "transparency": 0.5,
+    "zIndex": 999,
+    "directURL": "http://127.0.0.1:8000/cog/bbox/72.0254,15.7501,100.7698,34.2257.tif?url=path/to/cog.tif&bidx=1&bidx=2&bidx=4&rescale=0%2C1000&rescale=0%2C1000&rescale=0%2C1000"
+  }
+]' --output all_files.zip
 ```
