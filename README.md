@@ -7,6 +7,7 @@ A Flask server for downloading and processing Cloud Optimized GeoTIFFs (COGs) ba
 - Download single-band COGs from TiTiler
 - Download multi-band COGs with RGB bands
 - Stack multiple COGs into a single multi-band image
+- Stack multiple layers with transparency and z-index control
 - Apply min/max rescaling based on URL parameters
 - Crop COGs to a specific area of interest (AOI)
 - Output in TIFF or PNG format
@@ -105,6 +106,43 @@ Downloads multiple COGs and stacks them into a single multi-band GeoTIFF.
 
 The endpoint returns the stacked COG file as an attachment.
 
+### 3. Stack Layers with Transparency
+
+`POST /stack-layers`
+
+Stack multiple layers with transparency control based on z-index.
+
+#### Request Body
+
+```json
+[
+  {
+    "transparency": 0.5,
+    "zIndex": 1000,
+    "directURL": "http://127.0.0.1:8000/cog/bbox/minx,miny,maxx,maxy.tif?url=path/to/cog.tif&bidx=1&bidx=2&bidx=3&rescale=0,1000"
+  },
+  {
+    "transparency": 0.5,
+    "zIndex": 999,
+    "directURL": "http://127.0.0.1:8000/cog/bbox/minx,miny,maxx,maxy.tif?url=path/to/cog.tif&bidx=1&bidx=2&bidx=3&rescale=0,1000"
+  }
+]
+```
+
+Each layer object in the array must contain:
+
+- `transparency`: Float value from 0.0 (fully transparent) to 1.0 (fully opaque)
+- `zIndex`: Integer for determining layer order (higher number = on top)
+- `directURL`: TiTiler URL for the layer, including bbox coordinates and band/rescale parameters
+
+#### Optional Query Parameters
+
+- `format`: Output format (`tiff` or `png`). Defaults to `tiff` if not specified.
+
+#### Response
+
+The endpoint returns the stacked layers as a file attachment in the requested format.
+
 ## Examples
 
 ### 1. Download a Single-Band COG
@@ -144,14 +182,42 @@ curl -X POST "http://localhost:5000/stack-cogs" \
   }'
 ```
 
-### 1. Download a Single-Band COG as PNG
+### 4. Stack Layers with Transparency
 
 ```bash
-curl -X POST "http://localhost:5000/download-cog" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "url": "https://titiler.example.com/cog/viewer?url=https://example.com/cog.tif&rescale=0,100",
-    "aoi": [10.0, 20.0, 11.0, 21.0],
-    "format": "png"
-  }'
+curl --location 'http://localhost:5000/stack-layers' \
+--header 'accept: application/json' \
+--header 'Content-Type: application/json' \
+--data '[
+  {
+    "transparency": 0.5,
+    "zIndex": 1000,
+    "directURL": "http://127.0.0.1:8000/cog/bbox/72.0254,15.7501,100.7698,34.2257.tif?url=C%3A%5Crepos%5CPoint-prober%5Cdata%5C3RIMG_22MAR2025_0915_L1C_ASIA_MER_V01R00.cog.tif&bidx=1&bidx=3&bidx=4&rescale=0%2C1000&rescale=0%2C1000&rescale=0%2C1000"
+  },
+  {
+    "transparency": 0.5,
+    "zIndex": 999,
+    "directURL": "http://127.0.0.1:8000/cog/bbox/72.0254,15.7501,100.7698,34.2257.tif?url=C%3A%5Crepos%5CPoint-prober%5Cdata%5C3RIMG_22MAR2025_0915_L1C_ASIA_MER_V01R00.cog.tif&bidx=1&bidx=2&bidx=4&rescale=0%2C1000&rescale=0%2C1000&rescale=0%2C1000"
+  }
+]' --output test_output.tif
+```
+
+### 5. Stack Layers and Output as PNG
+
+```bash
+curl --location 'http://localhost:5000/stack-layers?format=png' \
+--header 'accept: application/json' \
+--header 'Content-Type: application/json' \
+--data '[
+  {
+    "transparency": 0.5,
+    "zIndex": 1000,
+    "directURL": "http://127.0.0.1:8000/cog/bbox/72.0254,15.7501,100.7698,34.2257.tif?url=path/to/cog.tif&bidx=1&bidx=3&bidx=4&rescale=0%2C1000&rescale=0%2C1000&rescale=0%2C1000"
+  },
+  {
+    "transparency": 0.5,
+    "zIndex": 999,
+    "directURL": "http://127.0.0.1:8000/cog/bbox/72.0254,15.7501,100.7698,34.2257.tif?url=path/to/cog.tif&bidx=1&bidx=2&bidx=4&rescale=0%2C1000&rescale=0%2C1000&rescale=0%2C1000"
+  }
+]' --output test_output.png
 ```
