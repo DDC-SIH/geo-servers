@@ -617,10 +617,46 @@ def convert_tiff_to_png(tiff_path, png_path):
             data = src.read(1)
             # No need for reshaping for single band
         
-        # Save as PNG
+        # Handle floating point values appropriately
         if src.count >= 3:
+            # Normalize RGB data if it's floating point
+            if np.issubdtype(rgb.dtype, np.floating):
+                # Check if data has negative values
+                if np.min(rgb) < 0:
+                    # Apply offset and normalization
+                    min_val = np.min(rgb)
+                    rgb = rgb - min_val  # Shift to positive range
+                    max_val = np.max(rgb)
+                    if max_val > 0:
+                        rgb = rgb / max_val  # Normalize to 0-1
+                else:
+                    # Just normalize positive floating point values
+                    max_val = np.max(rgb)
+                    if max_val > 0:
+                        rgb = rgb / max_val
+            elif rgb.dtype != np.uint8:
+                # Convert other integer types to uint8
+                rgb = (rgb / np.iinfo(rgb.dtype).max * 255).astype(np.uint8)
+            
             plt.imsave(png_path, rgb)
         else:
+            # Handle single band data
+            if np.issubdtype(data.dtype, np.floating):
+                # For floating point data, normalize
+                if np.min(data) < 0:
+                    min_val = np.min(data)
+                    data = data - min_val
+                    max_val = np.max(data)
+                    if max_val > 0:
+                        data = data / max_val
+                else:
+                    max_val = np.max(data)
+                    if max_val > 0:
+                        data = data / max_val
+            elif data.dtype != np.uint8:
+                # Convert other integer types to 0-1 range
+                data = data.astype(float) / np.iinfo(data.dtype).max
+                
             plt.imsave(png_path, data, cmap='gray')
 
 def create_animation_from_layers(layers, output_path, temp_dir):
