@@ -11,6 +11,8 @@ A Flask server for downloading and processing Cloud Optimized GeoTIFFs (COGs) ba
 - Apply min/max rescaling based on URL parameters
 - Crop COGs to a specific area of interest (AOI)
 - Output in TIFF or PNG format
+- Create animated GIFs from sequence of layers
+- Package outputs and raw files in ZIP format
 
 ## Installation
 
@@ -138,50 +140,22 @@ Each layer object in the array must contain:
 #### Optional Query Parameters
 
 - `format`: Output format (`tiff` or `png`). Defaults to `tiff` if not specified.
-- `download`: When set to `yes`, returns a zip file containing both the raw source files and the stacked result.
+- `zip`: When set to `yes`, returns a zip file containing both the raw source files and the stacked result.
+- `animation`: When set to `yes`, creates an animated GIF from the provided layers in sequence.
+
+#### Optional Layer Properties
+
+- `animation`: Set to `yes` to enable animation mode (alternative to query parameter)
+- `id`: Custom identifier for the layer (used in filename when creating ZIP packages)
 
 #### Response
 
-The endpoint returns the stacked layers as a file attachment in the requested format. If `download=yes` is specified, it returns a zip file containing both the raw source files and the stacked result.
+The endpoint returns one of the following depending on the request parameters:
 
-## Examples
+- The stacked layers as a TIFF/PNG file attachment
+- A ZIP file containing both the raw source files and the stacked result when `zip=yes`
+- An animated GIF when `animation=yes` is specified
 
-### 1. Download a Single-Band COG
-
-```bash
-curl -X POST "http://localhost:5000/download-cog" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "url": "https://titiler.example.com/cog/viewer?url=https://example.com/cog.tif&rescale=0,100",
-    "aoi": [10.0, 20.0, 11.0, 21.0]
-  }'
-```
-
-### 2. Download a Multi-Band COG
-
-```bash
-curl -X POST "http://localhost:5000/download-cog" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "url": "https://titiler.example.com/cog/viewer?url=https://example.com/cog.tif&r=1&g=2&b=3&rescale_range.1.0=0&rescale_range.1.1=100&rescale_range.2.0=0&rescale_range.2.1=100&rescale_range.3.0=0&rescale_range.3.1=100",
-    "aoi": [10.0, 20.0, 11.0, 21.0]
-  }'
-```
-
-### 3. Stack Multiple COGs
-
-```bash
-curl -X POST "http://localhost:5000/stack-cogs" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "urls": [
-      "https://titiler.example.com/cog/viewer?url=https://example.com/cog1.tif&rescale=0,100",
-      "https://titiler.example.com/cog/viewer?url=https://example.com/cog2.tif&rescale=0,100",
-      "https://titiler.example.com/cog/viewer?url=https://example.com/cog3.tif&rescale=0,100"
-    ],
-    "aoi": [10.0, 20.0, 11.0, 21.0]
-  }'
-```
 
 ### 4. Stack Layers with Transparency
 
@@ -223,10 +197,10 @@ curl --location 'http://localhost:5000/stack-layers?format=png' \
 ]' --output test_output.png
 ```
 
-### 6. Stack Layers and Download Raw Files
+### 6. Stack Layers and Download Raw Files in ZIP
 
 ```bash
-curl --location 'http://localhost:5000/stack-layers?download=yes' \
+curl --location 'http://localhost:5000/stack-layers?zip=yes' \
 --header 'accept: application/json' \
 --header 'Content-Type: application/json' \
 --data '[
@@ -242,3 +216,84 @@ curl --location 'http://localhost:5000/stack-layers?download=yes' \
   }
 ]' --output all_files.zip
 ```
+
+### 7. Create an Animated GIF from Layers
+
+```bash
+curl --location 'http://localhost:5000/stack-layers?animation=yes' \
+--header 'accept: application/json' \
+--header 'Content-Type: application/json' \
+--data '[
+  {
+    "transparency": 1.0,
+    "zIndex": 1000,
+    "directURL": "http://127.0.0.1:8000/cog/bbox/72.0254,15.7501,100.7698,34.2257.tif?url=path/to/cog.tif&bidx=1&bidx=3&bidx=4&rescale=0%2C1000&rescale=0%2C1000&rescale=0%2C1000"
+  },
+  {
+    "transparency": 1.0,
+    "zIndex": 999,
+    "directURL": "http://127.0.0.1:8000/cog/bbox/72.0254,15.7501,100.7698,34.2257.tif?url=path/to/cog.tif&bidx=1&bidx=2&bidx=4&rescale=0%2C1000&rescale=0%2C1000&rescale=0%2C1000"
+  }
+]' --output animation.gif
+```
+
+### 8. Alternative Method to Create Animation Using Layer Property
+
+```bash
+curl --location 'http://localhost:5000/stack-layers' \
+--header 'accept: application/json' \
+--header 'Content-Type: application/json' \
+--data '[
+  {
+    "transparency": 1.0,
+    "zIndex": 1000,
+    "animation": "yes",
+    "directURL": "http://127.0.0.1:8000/cog/bbox/72.0254,15.7501,100.7698,34.2257.tif?url=path/to/cog.tif&bidx=1&bidx=3&bidx=4&rescale=0%2C1000&rescale=0%2C1000&rescale=0%2C1000"
+  },
+  {
+    "transparency": 1.0,
+    "zIndex": 999,
+    "directURL": "http://127.0.0.1:8000/cog/bbox/72.0254,15.7501,100.7698,34.2257.tif?url=path/to/cog.tif&bidx=1&bidx=2&bidx=4&rescale=0%2C1000&rescale=0%2C1000&rescale=0%2C1000"
+  }
+]' --output animation.gif
+```
+
+## Additional Information
+
+### Local File Processing
+
+The server can process COGs directly from local files if TiTiler is unavailable or cannot access the files. This serves as a fallback mechanism and requires:
+
+1. TiTiler to be running locally
+2. The URL parameter in the TiTiler URL to point to a local file
+3. Proper permissions for the Flask application to access the local file
+
+### Error Handling
+
+The API includes robust error handling for common issues:
+
+- Invalid input JSON
+- Missing required parameters
+- Failed downloads from TiTiler
+- Problems with file processing
+- Permission errors
+
+Detailed error messages are returned as JSON responses with appropriate HTTP status codes.
+
+### Default Values
+
+- Default output format: TIFF
+- Default animation frame rate: 1 second per frame
+- Default transparency: 1.0 (fully opaque)
+- Default zIndex: 0
+
+## Dependencies
+
+- Flask
+- NumPy
+- Rasterio
+- Requests
+- Matplotlib
+- Imageio (for animations)
+- PIL/Pillow
+- Shapely

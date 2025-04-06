@@ -17,6 +17,8 @@ from matplotlib.colors import Normalize
 import re
 import zipfile
 from io import BytesIO
+import imageio
+from PIL import Image
 
 # Configure logging
 logging.basicConfig(level=logging.DEBUG, 
@@ -51,12 +53,24 @@ def stack_layers():
         output_format = request.args.get('format', 'tiff').lower()
         create_zip = request.args.get('zip', 'no').lower() == 'yes'
         
+        # Check if animation is requested - either in query params or any layer has animation: true
+        create_animation = request.args.get('animation', 'no').lower() == 'yes'
+        
+        if not create_animation:
+            for layer in layers:
+                if layer.get('animation', '').lower() == 'yes' or layer.get('animation', False) is True:
+                    create_animation = True
+                    break
+        
         # Create a temporary directory to store files
         temp_dir = tempfile.mkdtemp()
         logger.debug(f"Created temporary directory: {temp_dir}")
         
         # Choose file extension based on format
-        if output_format == 'png':
+        if create_animation:
+            file_ext = 'gif'
+            output_format = 'gif'
+        elif output_format == 'png':
             file_ext = 'png'
         else:
             file_ext = 'tiff'
@@ -64,6 +78,18 @@ def stack_layers():
             
         output_path = os.path.join(temp_dir, f"stacked_output.{file_ext}")
         temp_tiff_path = os.path.join(temp_dir, "stacked_output_temp.tiff")
+        
+        # For animation, we need to handle frame generation differently
+        if create_animation:
+            animation_result = create_animation_from_layers(layers, output_path, temp_dir)
+            if not animation_result:
+                logger.error("Failed to create animation.")
+                return jsonify({"error": "Failed to create animation."}), 500
+            
+            # Return the animation file
+            logger.debug(f"Successfully created animation: {output_path} ({os.path.getsize(output_path)} bytes)")
+            return send_file(output_path, mimetype='image/gif',
+                           as_attachment=True, download_name="animation.gif")
         
         # Sort layers by zIndex, highest zIndex on top
         sorted_layers = sorted(layers, key=lambda x: x.get('zIndex', 0))
@@ -596,6 +622,83 @@ def convert_tiff_to_png(tiff_path, png_path):
             plt.imsave(png_path, rgb)
         else:
             plt.imsave(png_path, data, cmap='gray')
+
+def create_animation_from_layers(layers, output_path, temp_dir):
+    """
+    Create an animated GIF from a sequence of layers.
+    
+    Args:
+        layers: List of layer objects with directURL properties
+        output_path: Path to save the final GIF
+        temp_dir: Temporary directory for processing
+        
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    try:
+        logger.debug("Creating animation from layers")
+        
+        # Process each frame
+        frame_files = []
+        
+        for i, layer in enumerate(layers):
+            try:
+                # Extract layer properties
+                layer_id = layer.get('id', f"frame_{i}")
+                direct_url = layer.get('directURL', '')
+                
+                if not direct_url:
+                    logger.warning(f"Skipping frame {i}: Missing directURL")
+                    continue
+                
+                # Process the frame
+                logger.debug(f"Processing frame {i} from URL: {direct_url}")
+                
+                # Download and process the frame
+                frame_tiff = os.path.join(temp_dir, f"frame_{i}.tiff")
+                frame_png = os.path.join(temp_dir, f"frame_{i}.png")
+                
+                # Validate and extract TiTiler URL
+                validated_url, error = extract_and_validate_titiler_url(direct_url)
+                if error:
+                    logger.error(f"Invalid TiTiler URL for frame {i}: {error}")
+                    continue
+                
+                # Download the frame
+                download_result = download_from_titiler(validated_url, frame_tiff)
+                if not download_result:
+                    logger.error(f"Failed to download frame {i}")
+                    continue
+                
+                # Convert to PNG for animation
+                convert_tiff_to_png(frame_tiff, frame_png)
+                frame_files.append(frame_png)
+                
+                logger.debug(f"Successfully processed frame {i}")
+                
+            except Exception as e:
+                logger.error(f"Error processing frame {i}: {str(e)}", exc_info=True)
+                continue
+        
+        if not frame_files:
+            logger.error("No frames could be processed for animation")
+            return False
+            
+        # Create the animated GIF
+        logger.debug(f"Creating GIF from {len(frame_files)} frames")
+        
+        # Use imageio to create the GIF with 1 second interval
+        with imageio.get_writer(output_path, mode='I', duration=1, loop=0) as writer:
+            for frame_file in frame_files:
+                image = imageio.imread(frame_file)
+                writer.append_data(image)
+        
+        logger.debug(f"Successfully created GIF: {output_path}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error creating animation: {str(e)}", exc_info=True)
+        return False
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000)
