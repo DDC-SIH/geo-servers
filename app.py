@@ -19,6 +19,7 @@ import zipfile
 from io import BytesIO
 import imageio
 from PIL import Image
+import traceback
 
 # Configure logging
 logging.basicConfig(level=logging.DEBUG, 
@@ -26,6 +27,175 @@ logging.basicConfig(level=logging.DEBUG,
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
+
+# Add middleware to preprocess raw JSON before Flask parses it
+@app.before_request
+def preprocess_json():
+    """
+    Preprocesses incoming JSON data to fix common formatting errors before Flask's JSON parser handles it.
+    This helps users who might be unfamiliar with strict JSON syntax requirements.
+    """
+    if request.method == 'POST' and request.content_type and 'application/json' in request.content_type:
+        try:
+            # Get raw data as text
+            raw_data = request.get_data(as_text=True)
+            if not raw_data:
+                return
+            
+            # Common JSON syntax fixes
+            fixed_data = raw_data
+            
+            # Fix unquoted 'yes'/'no' values to proper JSON booleans
+            # Match "key": yes or "key":yes patterns
+            fixed_data = re.sub(r'("[^"]+"\s*:\s*)yes([,\s\}])', r'\1true\2', fixed_data)
+            fixed_data = re.sub(r'("[^"]+"\s*:\s*)no([,\s\}])', r'\1false\2', fixed_data)
+            
+            # Fix missing commas between key-value pairs
+            # This pattern looks for end of a value (not a comma) followed by a key
+            fixed_data = re.sub(r'(true|false|null|"[^"]*"|\d+)(\s*\n?\s*)("[^"]+"\s*:)', r'\1,\2\3', fixed_data)
+            
+            # Fix single quotes used instead of double quotes for keys or string values
+            fixed_data = re.sub(r"'([^']+)'(\s*:)", r'"\1"\2', fixed_data)  # Fix keys
+            fixed_data = re.sub(r':\s*\'([^\']+)\'([,\s\}])', r': "\1"\2', fixed_data)  # Fix values
+            
+            # Fix trailing commas in objects and arrays
+            fixed_data = re.sub(r',(\s*[\]}])', r'\1', fixed_data)
+            
+            # Log the changes if any were made
+            if fixed_data != raw_data:
+                logger.debug("JSON automatically fixed by preprocessor")
+                if app.debug:
+                    # In debug mode, show the difference
+                    logger.debug(f"Original JSON (first 200 chars): {raw_data[:200]}")
+                    logger.debug(f"Fixed JSON (first 200 chars): {fixed_data[:200]}")
+                
+                # Store the fixed data for Flask to use
+                request.data = fixed_data.encode('utf-8')
+                
+        except Exception as e:
+            logger.warning(f"Error in JSON preprocessor: {str(e)}")
+            # Continue with original data, let Flask handle any remaining errors
+
+# Add a helper function to provide detailed JSON validation
+def get_json_with_detailed_error(request_obj):
+    """Helper function to get JSON with detailed error messages"""
+    try:
+        return request_obj.json, None
+    except Exception as e:
+        raw_data = request_obj.get_data(as_text=True)
+        error_details = str(e)
+        
+        # Extract line and column information
+        line_num = col_num = None
+        if "line" in error_details and "column" in error_details:
+            line_match = re.search(r'line (\d+)', error_details)
+            col_match = re.search(r'column (\d+)', error_details)
+            if line_match and col_match:
+                line_num = int(line_match.group(1))
+                col_num = int(col_match.group(1))
+        
+        # Format the error location
+        error_location = ""
+        if line_num is not None and col_num is not None:
+            lines = raw_data.split('\n')
+            if 0 < line_num <= len(lines):
+                problem_line = lines[line_num-1]
+                pointer = ' ' * (col_num-1) + '^'
+                error_location = f"\nError at line {line_num}, column {col_num}:\n{problem_line}\n{pointer}"
+        
+        # Try to identify common issues
+        suggestions = []
+        if '"' in error_details or "quote" in error_details.lower():
+            suggestions.append("Check for unmatched quotes or missing quotes around string values")
+        if "Expecting ',' delimiter" in error_details:
+            suggestions.append("Check for missing commas between JSON objects or array items")
+        if "Expecting property name" in error_details:
+            suggestions.append("Check for missing or improperly formatted property names")
+        if "value" in error_details.lower():
+            suggestions.append("Check for invalid values (boolean values must be true/false, not yes/no)")
+        
+        # Create a detailed error message
+        detailed_error = {
+            "error": "Invalid JSON",
+            "details": error_details,
+            "location": error_location,
+            "suggestions": suggestions
+        }
+        
+        return None, detailed_error
+
+# Add a route to validate curl commands for the API
+@app.route('/validate-curl', methods=['POST'])
+def validate_curl():
+    """
+    Validates a curl command and returns a corrected version if needed.
+    
+    Expected input:
+    {
+        "curl_command": "curl --location 'http://localhost:5000/stack-layers' ..."
+    }
+    """
+    try:
+        data = request.json
+        if not data or not isinstance(data, dict):
+            return jsonify({"error": "Request must contain JSON with a 'curl_command' field"}), 400
+            
+        curl_command = data.get('curl_command', '')
+        if not curl_command:
+            return jsonify({"error": "Missing 'curl_command' field"}), 400
+            
+        # Extract the JSON payload from the curl command
+        json_match = re.search(r"--data\s+'(.*?)'\s*($|\\|\n)", curl_command, re.DOTALL)
+        if not json_match:
+            return jsonify({"error": "Could not find JSON payload in curl command"}), 400
+            
+        json_payload = json_match.group(1)
+        
+        # Fix common JSON errors
+        fixed_data = json_payload
+        
+        # Fix unquoted yes/no
+        fixed_data = re.sub(r'("[^"]+"\s*:\s*)yes([,\s\}])', r'\1true\2', fixed_data)
+        fixed_data = re.sub(r'("[^"]+"\s*:\s*)no([,\s\}])', r'\1false\2', fixed_data)
+        
+        # Fix missing commas
+        fixed_data = re.sub(r'(true|false|null|"[^"]*"|\d+)(\s*\n?\s*)("[^"]+"\s*:)', r'\1,\2\3', fixed_data)
+        
+        # Fix single quotes
+        fixed_data = re.sub(r"'([^']+)'(\s*:)", r'"\1"\2', fixed_data)
+        fixed_data = re.sub(r':\s*\'([^\']+)\'([,\s\}])', r': "\1"\2', fixed_data)
+        
+        # Fix trailing commas
+        fixed_data = re.sub(r',(\s*[\]}])', r'\1', fixed_data)
+        
+        # Check if the JSON is valid now
+        try:
+            json.loads(fixed_data)
+            is_valid = True
+        except json.JSONDecodeError as e:
+            is_valid = False
+            error_message = str(e)
+        
+        # Create the response
+        result = {
+            "original_curl": curl_command,
+            "is_valid": is_valid
+        }
+        
+        if fixed_data != json_payload:
+            # Replace the JSON in the curl command
+            fixed_curl = curl_command.replace(json_payload, fixed_data)
+            result["fixed_curl"] = fixed_curl
+            result["fixed_json"] = fixed_data
+            
+        if not is_valid:
+            result["error"] = error_message
+            
+        return jsonify(result)
+            
+    except Exception as e:
+        logger.error(f"Error in validate_curl: {str(e)}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
 
 @app.route('/stack-layers', methods=['POST'])
 def stack_layers():
@@ -43,8 +213,44 @@ def stack_layers():
     ]
     """
     try:
-        # Get the layers from the request
-        layers = request.json
+        # Get the layers from the request with better error handling
+        try:
+            # First try to get the JSON directly
+            layers = request.json
+        except Exception as e:
+            # If that fails, try to manually parse the raw data
+            logger.error(f"JSON parsing error: {str(e)}")
+            
+            # Get the raw request data and try to diagnose the issue
+            raw_data = request.get_data(as_text=True)
+            logger.debug(f"Raw request data (first 200 chars): {raw_data[:200]}")
+            
+            # Try to find obvious JSON errors
+            error_details = str(e)
+            if "line" in error_details and "column" in error_details:
+                # Try to extract line and column from error
+                try:
+                    line_match = re.search(r'line (\d+)', error_details)
+                    col_match = re.search(r'column (\d+)', error_details)
+                    
+                    if line_match and col_match:
+                        line_num = int(line_match.group(1))
+                        col_num = int(col_match.group(1))
+                        
+                        # Get the problematic line
+                        lines = raw_data.split('\n')
+                        if 0 < line_num <= len(lines):
+                            problem_line = lines[line_num-1]
+                            pointer = ' ' * (col_num-1) + '^'
+                            logger.error(f"JSON error near:\n{problem_line}\n{pointer}")
+                except Exception:
+                    pass
+            
+            return jsonify({
+                "error": "Invalid JSON in request", 
+                "details": str(e),
+                "help": "Please validate your JSON input. Common issues include missing commas, unquoted property names, or trailing commas."
+            }), 400
         
         if not layers or not isinstance(layers, list):
             return jsonify({"error": "Invalid input. Expected a list of layers."}), 400
@@ -220,7 +426,14 @@ def stack_layers():
     
     except Exception as e:
         logger.error(f"General error in stack_layers: {str(e)}", exc_info=True)
-        return jsonify({"error": str(e)}), 500
+        # Include stack trace in debug mode
+        error_details = {
+            "error": str(e),
+            "type": type(e).__name__
+        }
+        if app.debug:
+            error_details["traceback"] = traceback.format_exc()
+        return jsonify(error_details), 500
     
     finally:
         # Clean up temporary files
