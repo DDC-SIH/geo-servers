@@ -22,6 +22,7 @@ from PIL import Image
 import traceback
 import concurrent.futures
 from threading import Lock
+from dataclasses import dataclass
 
 # Configure logging
 logging.basicConfig(level=logging.DEBUG, 
@@ -199,254 +200,15 @@ def validate_curl():
         logger.error(f"Error in validate_curl: {str(e)}", exc_info=True)
         return jsonify({"error": str(e)}), 500
 
-@app.route('/stack-layers', methods=['POST'])
-def stack_layers():
-    """
-    Stack multiple layers based on z-index with transparency.
-    
-    Simplified JSON input:
-    [
-        {
-            "transparency": 1.0,
-            "zIndex": 1000,
-            "directURL": "http://titiler_url/cog/bbox/minx,miny,maxx,maxy.tif?parameters"
-        },
-        ...
-    ]
-    """
-    try:
-        # Get the layers from the request with better error handling
-        try:
-            layers = request.json
-        except Exception as e:
-            logger.error(f"JSON parsing error: {str(e)}")
-            raw_data = request.get_data(as_text=True)
-            logger.debug(f"Raw request data (first 200 chars): {raw_data[:200]}")
-            return jsonify({
-                "error": "Invalid JSON in request", 
-                "details": str(e),
-                "help": "Please validate your JSON input. Common issues include missing commas, unquoted property names, or trailing commas."
-            }), 400
-        
-        if not layers or not isinstance(layers, list):
-            return jsonify({"error": "Invalid input. Expected a list of layers."}), 400
-        
-        output_format = request.args.get('format', 'tiff').lower()
-        create_zip = request.args.get('zip', 'no').lower() == 'yes'
-        create_animation = request.args.get('animation', 'no').lower() == 'yes'
-        
-        if not create_animation:
-            for layer in layers:
-                if layer.get('animation', '').lower() == 'yes' or layer.get('animation', False) is True:
-                    create_animation = True
-                    break
-        
-        temp_dir = tempfile.mkdtemp()
-        logger.debug(f"Created temporary directory: {temp_dir}")
-        
-        if create_animation:
-            file_ext = 'gif'
-            output_format = 'gif'
-        elif output_format == 'png':
-            file_ext = 'png'
-        else:
-            file_ext = 'tiff'
-            output_format = 'tiff'
-            
-        output_path = os.path.join(temp_dir, f"stacked_output.{file_ext}")
-        temp_tiff_path = os.path.join(temp_dir, "stacked_output_temp.tiff")
-        
-        if create_animation:
-            animation_result = create_animation_from_layers(layers, output_path, temp_dir)
-            if not animation_result:
-                logger.error("Failed to create animation.")
-                return jsonify({"error": "Failed to create animation."}), 500
-            
-            logger.debug(f"Successfully created animation: {output_path} ({os.path.getsize(output_path)} bytes)")
-            return send_file(output_path, mimetype='image/gif',
-                           as_attachment=True, download_name="animation.gif")
-        
-        sorted_layers = sorted(layers, key=lambda x: x.get('zIndex', 0))
-        logger.debug(f"Processing {len(sorted_layers)} layers")
-        
-        processed_layers = []
-        reference_lock = Lock()
-        reference_data = {
-            'transform': None,
-            'crs': None,
-            'width': None,
-            'height': None,
-            'bbox': None
-        }
-        
-        def process_layer(layer_index, layer):
-            try:
-                layer_id = layer.get('id', f"layer_{layer_index}")
-                direct_url = layer.get('directURL', '')
-                transparency = float(layer.get('transparency', 1.0))
-                
-                if not direct_url:
-                    logger.warning(f"Skipping layer {layer_id}: Missing directURL.")
-                    return None
-                
-                logger.debug(f"Processing layer {layer_id} with transparency {transparency} and zIndex {layer.get('zIndex')}")
-                
-                validated_url, error = extract_and_validate_titiler_url(direct_url)
-                if error:
-                    logger.error(f"Invalid TiTiler URL for layer {layer_id}: {error}")
-                    return None
-                
-                layer_file = os.path.join(temp_dir, f"layer_{layer_id}.tiff")
-                download_result = download_from_titiler(validated_url, layer_file)
-                if not download_result:
-                    logger.error(f"Failed to download/process layer {layer_id}")
-                    return None
-                
-                if not os.path.exists(layer_file) or os.path.getsize(layer_file) < 100:
-                    logger.error(f"Layer file is missing or too small: {layer_file}")
-                    return None
-                
-                try:
-                    with rasterio.open(layer_file) as src:
-                        with reference_lock:
-                            if reference_data['transform'] is None:
-                                reference_data['transform'] = src.transform
-                                reference_data['crs'] = src.crs
-                                reference_data['width'] = src.width
-                                reference_data['height'] = src.height
-                                reference_data['bbox'] = src.bounds
-                                logger.debug(f"Reference layer set: {src.width}x{src.height}, CRS: {src.crs}")
-                        
-                        return {
-                            'file': layer_file,
-                            'transparency': transparency,
-                            'id': layer_id
-                        }
-                        
-                except rasterio.errors.RasterioIOError as e:
-                    logger.error(f"Failed to open raster file for layer {layer_id}: {str(e)}")
-                    return None
-                
-            except Exception as e:
-                logger.error(f"Error processing layer {layer.get('id', f'layer_{layer_index}')}: {str(e)}", exc_info=True)
-                return None
-        
-        max_workers = min(len(sorted_layers), os.cpu_count() or 4)
-        logger.debug(f"Processing layers using {max_workers} threads")
-        
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_layer = {
-                executor.submit(process_layer, i, layer): (i, layer) 
-                for i, layer in enumerate(sorted_layers)
-            }
-            
-            for future in concurrent.futures.as_completed(future_to_layer):
-                layer_info = future.result()
-                if layer_info:
-                    processed_layers.append(layer_info)
-        
-        if not processed_layers:
-            logger.error("No layers could be processed.")
-            return jsonify({"error": "No layers could be processed."}), 400
-        
-        logger.debug(f"Successfully processed {len(processed_layers)} layers out of {len(sorted_layers)}")
-        
-        if reference_data['transform'] is None and processed_layers:
-            with rasterio.open(processed_layers[0]['file']) as src:
-                reference_data['transform'] = src.transform
-                reference_data['crs'] = src.crs
-                reference_data['width'] = src.width
-                reference_data['height'] = src.height
-                reference_data['bbox'] = src.bounds
-        
-        stack_result = stack_layers_with_transparency(
-            processed_layers,
-            temp_tiff_path,
-            reference_data['transform'],
-            reference_data['crs'],
-            reference_data['width'],
-            reference_data['height']
-        )
-        
-        if not stack_result:
-            logger.error("Failed to stack layers.")
-            return jsonify({"error": "Failed to stack layers."}), 500
-        
-        logger.debug(f"Successfully stacked layers to {temp_tiff_path} ({os.path.getsize(temp_tiff_path)} bytes)")
-        
-        if output_format == 'png':
-            convert_tiff_to_png(temp_tiff_path, output_path)
-            logger.debug(f"Converted to PNG: {output_path} ({os.path.getsize(output_path)} bytes)")
-        else:
-            shutil.copy(temp_tiff_path, output_path)
-            logger.debug(f"Copied to output: {output_path} ({os.path.getsize(output_path)} bytes)")
-        
-        if create_zip:
-            logger.debug("Creating ZIP file with all layers and result")
-            zip_path = os.path.join(temp_dir, "stacked_layers_package.zip")
-            
-            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-                zipf.write(output_path, os.path.basename(output_path))
-                
-                for layer in processed_layers:
-                    layer_filename = os.path.basename(layer['file'])
-                    zipf.write(layer['file'], f"raw_layers/{layer['id']}_{layer_filename}")
-            
-            logger.debug(f"Created ZIP file: {zip_path} ({os.path.getsize(zip_path)} bytes)")
-            return send_file(zip_path, mimetype='application/zip',
-                           as_attachment=True, download_name="stacked_layers_package.zip")
-        else:
-            return send_file(output_path, mimetype=f'image/{file_ext}', 
-                            as_attachment=True, download_name=f"stacked_layers.{file_ext}")
-    
-    except Exception as e:
-        logger.error(f"General error in stack_layers: {str(e)}", exc_info=True)
-        error_details = {
-            "error": str(e),
-            "type": type(e).__name__
-        }
-        if app.debug:
-            error_details["traceback"] = traceback.format_exc()
-        return jsonify(error_details), 500
-    
-    finally:
-        if 'temp_dir' in locals():
-            logger.debug(f"Cleaning up temporary directory: {temp_dir}")
-            shutil.rmtree(temp_dir, ignore_errors=True)
-
-
-def extract_bbox_from_url(url):
-    """Extract bounding box coordinates from a TiTiler URL."""
-    if not url:
-        return None
-    
-    # Try to extract bbox from the URL path
-    bbox_pattern = r'/bbox/([^.]+)'
-    match = re.search(bbox_pattern, url)
-    
-    if match:
-        bbox_str = match.group(1)
-        try:
-            coords = [float(coord) for coord in bbox_str.split(',')]
-            if len(coords) == 4:
-                return coords  # [minx, miny, maxx, maxy]
-        except:
-            pass
-    
-    # Try to extract from query parameters
-    parsed_url = urlparse(url)
-    query_params = parse_qs(parsed_url.query)
-    
-    if 'bbox' in query_params:
-        try:
-            bbox_str = query_params['bbox'][0]
-            coords = [float(coord) for coord in bbox_str.split(',')]
-            if len(coords) == 4:
-                return coords  # [minx, miny, maxx, maxy]
-        except:
-            pass
-    
-    return None
+@dataclass
+class TitilerUrlData:
+    """Class for storing extracted data from TiTiler URLs"""
+    valid_url: str = None
+    local_file_path: str = None
+    band_indices: list = None
+    rescale_values: list = None
+    bbox: list = None
+    error: str = None
 
 def extract_and_validate_titiler_url(direct_url):
     """
@@ -454,9 +216,11 @@ def extract_and_validate_titiler_url(direct_url):
     Also extracts file path and parameters for direct processing.
     
     Returns:
-        tuple: (valid_url, error_message)
+        tuple: (TitilerUrlData object, error_message)
     """
     try:
+        result = TitilerUrlData()
+        
         # Handle URL-encoded parameters
         decoded_url = unquote(direct_url)
         
@@ -472,15 +236,9 @@ def extract_and_validate_titiler_url(direct_url):
         logger.debug(f"TiTiler URL parameters: {query_params}")
         
         # Extract file path and other parameters for direct processing
-        local_file_path = unquote(query_params['url'][0])
-        band_indices = [int(b) for b in query_params.get('bidx', [])] if 'bidx' in query_params else None
-        rescale_values = query_params.get('rescale', [])
-        
-        # Store these in flask.g for later use if TiTiler is unavailable
-        from flask import g
-        g.local_file_path = local_file_path
-        g.band_indices = band_indices
-        g.rescale_values = rescale_values
+        result.local_file_path = unquote(query_params['url'][0])
+        result.band_indices = [int(b) for b in query_params.get('bidx', [])] if 'bidx' in query_params else None
+        result.rescale_values = query_params.get('rescale', [])
         
         # Extract bbox from URL path
         bbox_pattern = r'/bbox/([^.]+)'
@@ -488,11 +246,11 @@ def extract_and_validate_titiler_url(direct_url):
         if match:
             bbox_str = match.group(1)
             try:
-                g.bbox = [float(coord) for coord in bbox_str.split(',')]
+                result.bbox = [float(coord) for coord in bbox_str.split(',')]
             except:
-                g.bbox = None
+                result.bbox = None
         else:
-            g.bbox = None
+            result.bbox = None
         
         # Ensure bidx parameters are present if needed
         if 'bidx' not in query_params:
@@ -509,12 +267,111 @@ def extract_and_validate_titiler_url(direct_url):
             query_string = '&'.join([f"{k}={v}" for k, v in query_params.items() for v in query_params[k]])
             valid_url = f"{base_url}?{query_string}"
             logger.debug(f"Reconstructed URL: {valid_url}")
-            return valid_url, None
+            result.valid_url = valid_url
+            return result, None
         
-        return decoded_url, None
+        result.valid_url = decoded_url
+        return result, None
         
     except Exception as e:
         return None, f"Error validating TiTiler URL: {str(e)}"
+
+def download_from_titiler(titiler_url_data, output_path):
+    """Download a COG from TiTiler."""
+    try:
+        if not titiler_url_data or not titiler_url_data.valid_url:
+            logger.error("Invalid TiTiler URL data")
+            return False
+            
+        # Handle URL-encoded parameters
+        decoded_url = titiler_url_data.valid_url
+        logger.debug(f"Downloading from URL: {decoded_url}")
+        
+        try:
+            # Try to download from TiTiler
+            response = requests.get(decoded_url, stream=True, timeout=5)
+            if response.status_code != 200:
+                logger.warning(f"Failed to download from TiTiler: {response.status_code} - {response.text}")
+                # Fall back to direct file processing
+                if titiler_url_data.local_file_path:
+                    logger.info(f"Falling back to direct file processing")
+                    return process_local_file(
+                        titiler_url_data.local_file_path, 
+                        output_path, 
+                        bbox=titiler_url_data.bbox,
+                        band_indices=titiler_url_data.band_indices,
+                        rescale_values=titiler_url_data.rescale_values
+                    )
+                return False
+            
+            # Write response to file
+            with open(output_path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:  # filter out keep-alive chunks
+                        f.write(chunk)
+            
+            if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+                logger.debug(f"Successfully downloaded from TiTiler to {output_path}")
+                return True
+            else:
+                logger.warning(f"Download seemed successful but file is empty: {output_path}")
+                # Fall back to direct file processing
+                if titiler_url_data.local_file_path:
+                    logger.info(f"Falling back to direct file processing")
+                    return process_local_file(
+                        titiler_url_data.local_file_path, 
+                        output_path, 
+                        bbox=titiler_url_data.bbox,
+                        band_indices=titiler_url_data.band_indices,
+                        rescale_values=titiler_url_data.rescale_values
+                    )
+                return False
+                
+        except requests.exceptions.RequestException as e:
+            logger.warning(f"TiTiler connection failed: {str(e)}")
+            
+            # Fall back to direct file processing
+            if titiler_url_data.local_file_path:
+                logger.info(f"Falling back to direct file processing")
+                return process_local_file(
+                    titiler_url_data.local_file_path, 
+                    output_path, 
+                    bbox=titiler_url_data.bbox,
+                    band_indices=titiler_url_data.band_indices,
+                    rescale_values=titiler_url_data.rescale_values
+                )
+            else:
+                logger.error("No local file path available for fallback processing")
+                return False
+        
+    except Exception as e:
+        logger.error(f"Error in download_from_titiler: {str(e)}", exc_info=True)
+        return False
+
+def read_full_image(src, bands_to_read, rescale_values=None):
+    """Helper function to read full image data."""
+    bands_data = []
+    for i, band in enumerate(bands_to_read):
+        data = src.read(band)
+        
+        # Apply rescaling if provided
+        if rescale_values and i < len(rescale_values):
+            try:
+                min_val, max_val = map(float, rescale_values[i].split(','))
+                data = np.clip(data, min_val, max_val)
+                data = ((data - min_val) / (max_val - min_val) * 255).astype(np.uint8)
+            except Exception as e:
+                logger.warning(f"Error applying rescale for band {band}: {str(e)}")
+        
+        bands_data.append(data)
+    
+    # Use original metadata with updated count
+    out_meta = src.meta.copy()
+    out_meta.update({
+        'count': len(bands_data),
+    })
+    
+    return bands_data, out_meta
 
 def process_local_file(file_path, output_path, bbox=None, band_indices=None, rescale_values=None):
     """Process local file directly when TiTiler is unavailable."""
@@ -583,102 +440,6 @@ def process_local_file(file_path, output_path, bbox=None, band_indices=None, res
             
     except Exception as e:
         logger.error(f"Error processing local file: {str(e)}", exc_info=True)
-        return False
-
-def read_full_image(src, bands_to_read, rescale_values=None):
-    """Helper function to read full image data."""
-    bands_data = []
-    for i, band in enumerate(bands_to_read):
-        data = src.read(band)
-        
-        # Apply rescaling if provided
-        if rescale_values and i < len(rescale_values):
-            try:
-                min_val, max_val = map(float, rescale_values[i].split(','))
-                data = np.clip(data, min_val, max_val)
-                data = ((data - min_val) / (max_val - min_val) * 255).astype(np.uint8)
-            except Exception as e:
-                logger.warning(f"Error applying rescale for band {band}: {str(e)}")
-        
-        bands_data.append(data)
-    
-    # Use original metadata with updated count
-    out_meta = src.meta.copy()
-    out_meta.update({
-        'count': len(bands_data),
-    })
-    
-    return bands_data, out_meta
-
-def download_from_titiler(titiler_url, output_path):
-    """Download a COG from TiTiler."""
-    try:
-        # Handle URL-encoded parameters
-        decoded_url = unquote(titiler_url)
-        logger.debug(f"Downloading from URL: {decoded_url}")
-        
-        try:
-            # Try to download from TiTiler
-            response = requests.get(decoded_url, stream=True, timeout=5)
-            if response.status_code != 200:
-                logger.warning(f"Failed to download from TiTiler: {response.status_code} - {response.text}")
-                # Fall back to direct file processing
-                from flask import g
-                if hasattr(g, 'local_file_path'):
-                    logger.info(f"Falling back to direct file processing")
-                    return process_local_file(
-                        g.local_file_path, 
-                        output_path, 
-                        bbox=getattr(g, 'bbox', None),
-                        band_indices=getattr(g, 'band_indices', None),
-                        rescale_values=getattr(g, 'rescale_values', None)
-                    )
-                return False
-            
-            # Write response to file
-            with open(output_path, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    if chunk:  # filter out keep-alive chunks
-                        f.write(chunk)
-            
-            if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
-                logger.debug(f"Successfully downloaded from TiTiler to {output_path}")
-                return True
-            else:
-                logger.warning(f"Download seemed successful but file is empty: {output_path}")
-                # Fall back to direct file processing
-                from flask import g
-                if hasattr(g, 'local_file_path'):
-                    logger.info(f"Falling back to direct file processing")
-                    return process_local_file(
-                        g.local_file_path, 
-                        output_path, 
-                        bbox=getattr(g, 'bbox', None),
-                        band_indices=getattr(g, 'band_indices', None),
-                        rescale_values=getattr(g, 'rescale_values', None)
-                    )
-                return False
-                
-        except requests.exceptions.RequestException as e:
-            logger.warning(f"TiTiler connection failed: {str(e)}")
-            
-            # Fall back to direct file processing
-            from flask import g
-            if hasattr(g, 'local_file_path'):
-                logger.info(f"Falling back to direct file processing")
-                return process_local_file(
-                    g.local_file_path, 
-                    output_path, 
-                    bbox=getattr(g, 'bbox', None),
-                    band_indices=getattr(g, 'band_indices', None),
-                    rescale_values=getattr(g, 'rescale_values', None)
-                )
-            else:
-                logger.error("No local file path available for fallback processing")
-                return False
-        
-    except Exception as e:
-        logger.error(f"Error in download_from_titiler: {str(e)}", exc_info=True)
         return False
 
 def stack_layers_with_transparency(layers, output_path, transform, crs, width, height):
@@ -882,13 +643,13 @@ def create_animation_from_layers(layers, output_path, temp_dir):
                 frame_png = os.path.join(temp_dir, f"frame_{i}.png")
                 
                 # Validate and extract TiTiler URL
-                validated_url, error = extract_and_validate_titiler_url(direct_url)
+                url_data, error = extract_and_validate_titiler_url(direct_url)
                 if error:
                     logger.error(f"Invalid TiTiler URL for frame {i}: {error}")
                     continue
                 
                 # Download the frame
-                download_result = download_from_titiler(validated_url, frame_tiff)
+                download_result = download_from_titiler(url_data, frame_tiff)
                 if not download_result:
                     logger.error(f"Failed to download frame {i}")
                     continue
@@ -922,6 +683,221 @@ def create_animation_from_layers(layers, output_path, temp_dir):
     except Exception as e:
         logger.error(f"Error creating animation: {str(e)}", exc_info=True)
         return False
+
+@app.route('/stack-layers', methods=['POST'])
+def stack_layers():
+    """
+    Stack multiple layers based on z-index with transparency.
+    
+    Simplified JSON input:
+    [
+        {
+            "transparency": 1.0,
+            "zIndex": 1000,
+            "directURL": "http://titiler_url/cog/bbox/minx,miny,maxx,maxy.tif?parameters"
+        },
+        ...
+    ]
+    """
+    try:
+        # Get the layers from the request with better error handling
+        try:
+            layers = request.json
+        except Exception as e:
+            logger.error(f"JSON parsing error: {str(e)}")
+            raw_data = request.get_data(as_text=True)
+            logger.debug(f"Raw request data (first 200 chars): {raw_data[:200]}")
+            return jsonify({
+                "error": "Invalid JSON in request", 
+                "details": str(e),
+                "help": "Please validate your JSON input. Common issues include missing commas, unquoted property names, or trailing commas."
+            }), 400
+        
+        if not layers or not isinstance(layers, list):
+            return jsonify({"error": "Invalid input. Expected a list of layers."}), 400
+        
+        output_format = request.args.get('format', 'tiff').lower()
+        create_zip = request.args.get('zip', 'no').lower() == 'yes'
+        create_animation = request.args.get('animation', 'no').lower() == 'yes'
+        
+        if not create_animation:
+            for layer in layers:
+                if layer.get('animation', '').lower() == 'yes' or layer.get('animation', False) is True:
+                    create_animation = True
+                    break
+        
+        temp_dir = tempfile.mkdtemp()
+        logger.debug(f"Created temporary directory: {temp_dir}")
+        
+        if create_animation:
+            file_ext = 'gif'
+            output_format = 'gif'
+        elif output_format == 'png':
+            file_ext = 'png'
+        else:
+            file_ext = 'tiff'
+            output_format = 'tiff'
+            
+        output_path = os.path.join(temp_dir, f"stacked_output.{file_ext}")
+        temp_tiff_path = os.path.join(temp_dir, "stacked_output_temp.tiff")
+        
+        if create_animation:
+            animation_result = create_animation_from_layers(layers, output_path, temp_dir)
+            if not animation_result:
+                logger.error("Failed to create animation.")
+                return jsonify({"error": "Failed to create animation."}), 500
+            
+            logger.debug(f"Successfully created animation: {output_path} ({os.path.getsize(output_path)} bytes)")
+            return send_file(output_path, mimetype='image/gif',
+                           as_attachment=True, download_name="animation.gif")
+        
+        sorted_layers = sorted(layers, key=lambda x: x.get('zIndex', 0))
+        logger.debug(f"Processing {len(sorted_layers)} layers")
+        
+        processed_layers = []
+        reference_lock = Lock()
+        reference_data = {
+            'transform': None,
+            'crs': None,
+            'width': None,
+            'height': None,
+            'bbox': None
+        }
+        
+        def process_layer(layer_index, layer):
+            try:
+                layer_id = layer.get('id', f"layer_{layer_index}")
+                direct_url = layer.get('directURL', '')
+                transparency = float(layer.get('transparency', 1.0))
+                
+                if not direct_url:
+                    logger.warning(f"Skipping layer {layer_id}: Missing directURL.")
+                    return None
+                
+                logger.debug(f"Processing layer {layer_id} with transparency {transparency} and zIndex {layer.get('zIndex')}")
+                
+                url_data, error = extract_and_validate_titiler_url(direct_url)
+                if error:
+                    logger.error(f"Invalid TiTiler URL for layer {layer_id}: {error}")
+                    return None
+                
+                layer_file = os.path.join(temp_dir, f"layer_{layer_id}.tiff")
+                download_result = download_from_titiler(url_data, layer_file)
+                if not download_result:
+                    logger.error(f"Failed to download/process layer {layer_id}")
+                    return None
+                
+                if not os.path.exists(layer_file) or os.path.getsize(layer_file) < 100:
+                    logger.error(f"Layer file is missing or too small: {layer_file}")
+                    return None
+                
+                try:
+                    with rasterio.open(layer_file) as src:
+                        with reference_lock:
+                            if reference_data['transform'] is None:
+                                reference_data['transform'] = src.transform
+                                reference_data['crs'] = src.crs
+                                reference_data['width'] = src.width
+                                reference_data['height'] = src.height
+                                reference_data['bbox'] = src.bounds
+                                logger.debug(f"Reference layer set: {src.width}x{src.height}, CRS: {src.crs}")
+                        
+                        return {
+                            'file': layer_file,
+                            'transparency': transparency,
+                            'id': layer_id
+                        }
+                        
+                except rasterio.errors.RasterioIOError as e:
+                    logger.error(f"Failed to open raster file for layer {layer_id}: {str(e)}")
+                    return None
+                
+            except Exception as e:
+                logger.error(f"Error processing layer {layer.get('id', f'layer_{layer_index}')}: {str(e)}", exc_info=True)
+                return None
+        
+        max_workers = min(len(sorted_layers), os.cpu_count() or 4)
+        logger.debug(f"Processing layers using {max_workers} threads")
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_layer = {
+                executor.submit(process_layer, i, layer): (i, layer) 
+                for i, layer in enumerate(sorted_layers)
+            }
+            
+            for future in concurrent.futures.as_completed(future_to_layer):
+                layer_info = future.result()
+                if layer_info:
+                    processed_layers.append(layer_info)
+        
+        if not processed_layers:
+            logger.error("No layers could be processed.")
+            return jsonify({"error": "No layers could be processed."}), 400
+        
+        logger.debug(f"Successfully processed {len(processed_layers)} layers out of {len(sorted_layers)}")
+        
+        if reference_data['transform'] is None and processed_layers:
+            with rasterio.open(processed_layers[0]['file']) as src:
+                reference_data['transform'] = src.transform
+                reference_data['crs'] = src.crs
+                reference_data['width'] = src.width
+                reference_data['height'] = src.height
+                reference_data['bbox'] = src.bounds
+        
+        stack_result = stack_layers_with_transparency(
+            processed_layers,
+            temp_tiff_path,
+            reference_data['transform'],
+            reference_data['crs'],
+            reference_data['width'],
+            reference_data['height']
+        )
+        
+        if not stack_result:
+            logger.error("Failed to stack layers.")
+            return jsonify({"error": "Failed to stack layers."}), 500
+        
+        logger.debug(f"Successfully stacked layers to {temp_tiff_path} ({os.path.getsize(temp_tiff_path)} bytes)")
+        
+        if output_format == 'png':
+            convert_tiff_to_png(temp_tiff_path, output_path)
+            logger.debug(f"Converted to PNG: {output_path} ({os.path.getsize(output_path)} bytes)")
+        else:
+            shutil.copy(temp_tiff_path, output_path)
+            logger.debug(f"Copied to output: {output_path} ({os.path.getsize(output_path)} bytes)")
+        
+        if create_zip:
+            logger.debug("Creating ZIP file with all layers and result")
+            zip_path = os.path.join(temp_dir, "stacked_layers_package.zip")
+            
+            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                zipf.write(output_path, os.path.basename(output_path))
+                
+                for layer in processed_layers:
+                    layer_filename = os.path.basename(layer['file'])
+                    zipf.write(layer['file'], f"raw_layers/{layer['id']}_{layer_filename}")
+            
+            logger.debug(f"Created ZIP file: {zip_path} ({os.path.getsize(zip_path)} bytes)")
+            return send_file(zip_path, mimetype='application/zip',
+                           as_attachment=True, download_name="stacked_layers_package.zip")
+        else:
+            return send_file(output_path, mimetype=f'image/{file_ext}', 
+                            as_attachment=True, download_name=f"stacked_layers.{file_ext}")
+    
+    except Exception as e:
+        logger.error(f"General error in stack_layers: {str(e)}", exc_info=True)
+        error_details = {
+            "error": str(e),
+            "type": type(e).__name__
+        }
+        if app.debug:
+            error_details["traceback"] = traceback.format_exc()
+        return jsonify(error_details), 500
+    
+    finally:
+        if 'temp_dir' in locals():
+            logger.debug(f"Cleaning up temporary directory: {temp_dir}")
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000)
