@@ -5,6 +5,21 @@
 A powerful Flask API for stacking, rescaling, and animating **Cloud-Optimized GeoTIFFs (COGs)** via **TiTiler URLs** or **local files**. Supports transparency, zIndex ordering, band selection, and temporal animations.
 
 ---
+Working
+```
+curl --location 'http://74.226.242.56:5000/stack-layers?animation=yes' \
+--header 'accept: application/json' \
+--header 'Content-Type: application/json' \
+--data '{
+  "directURL": "http://127.0.0.1:8000/cog/bbox/72.0254,15.7501,100.7698,34.2257.tif?url=/home/sbn/baivab/final/3RIMG/2025/03/22/3RIMG_{DATE}_{TIME}_L1C_ASIA_MER_V01R00.cog.tif&bidx=1&bidx=3&bidx=4&rescale=0,1000&rescale=0,1000&rescale=0,1000",
+  "date_range": ["2025-03-22", "2025-03-22"],
+  "time_range": ["09:15", "15:15"], 
+  "transparency": [0.5],
+  "zIndex": [1000],
+  "band_indices": [[1,3,4]]
+}' --output animation.gif
+
+```
 
 ## 🚀 Features
 
