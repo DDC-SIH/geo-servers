@@ -3,7 +3,7 @@ import json
 import tempfile
 import shutil
 import logging
-from urllib.parse import urlparse, parse_qs, unquote
+from urllib.parse import urlparse, parse_qs, unquote, urlunparse
 import requests
 import numpy as np
 import rasterio
@@ -23,6 +23,8 @@ import traceback
 import concurrent.futures
 from threading import Lock
 from dataclasses import dataclass
+from datetime import datetime, timedelta
+import itertools
 
 # Configure logging
 logging.basicConfig(level=logging.DEBUG, 
@@ -30,175 +32,6 @@ logging.basicConfig(level=logging.DEBUG,
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-
-# Add middleware to preprocess raw JSON before Flask parses it
-@app.before_request
-def preprocess_json():
-    """
-    Preprocesses incoming JSON data to fix common formatting errors before Flask's JSON parser handles it.
-    This helps users who might be unfamiliar with strict JSON syntax requirements.
-    """
-    if request.method == 'POST' and request.content_type and 'application/json' in request.content_type:
-        try:
-            # Get raw data as text
-            raw_data = request.get_data(as_text=True)
-            if not raw_data:
-                return
-            
-            # Common JSON syntax fixes
-            fixed_data = raw_data
-            
-            # Fix unquoted 'yes'/'no' values to proper JSON booleans
-            # Match "key": yes or "key":yes patterns
-            fixed_data = re.sub(r'("[^"]+"\s*:\s*)yes([,\s\}])', r'\1true\2', fixed_data)
-            fixed_data = re.sub(r'("[^"]+"\s*:\s*)no([,\s\}])', r'\1false\2', fixed_data)
-            
-            # Fix missing commas between key-value pairs
-            # This pattern looks for end of a value (not a comma) followed by a key
-            fixed_data = re.sub(r'(true|false|null|"[^"]*"|\d+)(\s*\n?\s*)("[^"]+"\s*:)', r'\1,\2\3', fixed_data)
-            
-            # Fix single quotes used instead of double quotes for keys or string values
-            fixed_data = re.sub(r"'([^']+)'(\s*:)", r'"\1"\2', fixed_data)  # Fix keys
-            fixed_data = re.sub(r':\s*\'([^\']+)\'([,\s\}])', r': "\1"\2', fixed_data)  # Fix values
-            
-            # Fix trailing commas in objects and arrays
-            fixed_data = re.sub(r',(\s*[\]}])', r'\1', fixed_data)
-            
-            # Log the changes if any were made
-            if fixed_data != raw_data:
-                logger.debug("JSON automatically fixed by preprocessor")
-                if app.debug:
-                    # In debug mode, show the difference
-                    logger.debug(f"Original JSON (first 200 chars): {raw_data[:200]}")
-                    logger.debug(f"Fixed JSON (first 200 chars): {fixed_data[:200]}")
-                
-                # Store the fixed data for Flask to use
-                request.data = fixed_data.encode('utf-8')
-                
-        except Exception as e:
-            logger.warning(f"Error in JSON preprocessor: {str(e)}")
-            # Continue with original data, let Flask handle any remaining errors
-
-# Add a helper function to provide detailed JSON validation
-def get_json_with_detailed_error(request_obj):
-    """Helper function to get JSON with detailed error messages"""
-    try:
-        return request_obj.json, None
-    except Exception as e:
-        raw_data = request_obj.get_data(as_text=True)
-        error_details = str(e)
-        
-        # Extract line and column information
-        line_num = col_num = None
-        if "line" in error_details and "column" in error_details:
-            line_match = re.search(r'line (\d+)', error_details)
-            col_match = re.search(r'column (\d+)', error_details)
-            if line_match and col_match:
-                line_num = int(line_match.group(1))
-                col_num = int(col_match.group(1))
-        
-        # Format the error location
-        error_location = ""
-        if line_num is not None and col_num is not None:
-            lines = raw_data.split('\n')
-            if 0 < line_num <= len(lines):
-                problem_line = lines[line_num-1]
-                pointer = ' ' * (col_num-1) + '^'
-                error_location = f"\nError at line {line_num}, column {col_num}:\n{problem_line}\n{pointer}"
-        
-        # Try to identify common issues
-        suggestions = []
-        if '"' in error_details or "quote" in error_details.lower():
-            suggestions.append("Check for unmatched quotes or missing quotes around string values")
-        if "Expecting ',' delimiter" in error_details:
-            suggestions.append("Check for missing commas between JSON objects or array items")
-        if "Expecting property name" in error_details:
-            suggestions.append("Check for missing or improperly formatted property names")
-        if "value" in error_details.lower():
-            suggestions.append("Check for invalid values (boolean values must be true/false, not yes/no)")
-        
-        # Create a detailed error message
-        detailed_error = {
-            "error": "Invalid JSON",
-            "details": error_details,
-            "location": error_location,
-            "suggestions": suggestions
-        }
-        
-        return None, detailed_error
-
-# Add a route to validate curl commands for the API
-@app.route('/validate-curl', methods=['POST'])
-def validate_curl():
-    """
-    Validates a curl command and returns a corrected version if needed.
-    
-    Expected input:
-    {
-        "curl_command": "curl --location 'http://localhost:5000/stack-layers' ..."
-    }
-    """
-    try:
-        data = request.json
-        if not data or not isinstance(data, dict):
-            return jsonify({"error": "Request must contain JSON with a 'curl_command' field"}), 400
-            
-        curl_command = data.get('curl_command', '')
-        if not curl_command:
-            return jsonify({"error": "Missing 'curl_command' field"}), 400
-            
-        # Extract the JSON payload from the curl command
-        json_match = re.search(r"--data\s+'(.*?)'\s*($|\\|\n)", curl_command, re.DOTALL)
-        if not json_match:
-            return jsonify({"error": "Could not find JSON payload in curl command"}), 400
-            
-        json_payload = json_match.group(1)
-        
-        # Fix common JSON errors
-        fixed_data = json_payload
-        
-        # Fix unquoted yes/no
-        fixed_data = re.sub(r'("[^"]+"\s*:\s*)yes([,\s\}])', r'\1true\2', fixed_data)
-        fixed_data = re.sub(r'("[^"]+"\s*:\s*)no([,\s\}])', r'\1false\2', fixed_data)
-        
-        # Fix missing commas
-        fixed_data = re.sub(r'(true|false|null|"[^"]*"|\d+)(\s*\n?\s*)("[^"]+"\s*:)', r'\1,\2\3', fixed_data)
-        
-        # Fix single quotes
-        fixed_data = re.sub(r"'([^']+)'(\s*:)", r'"\1"\2', fixed_data)
-        fixed_data = re.sub(r':\s*\'([^\']+)\'([,\s\}])', r': "\1"\2', fixed_data)
-        
-        # Fix trailing commas
-        fixed_data = re.sub(r',(\s*[\]}])', r'\1', fixed_data)
-        
-        # Check if the JSON is valid now
-        try:
-            json.loads(fixed_data)
-            is_valid = True
-        except json.JSONDecodeError as e:
-            is_valid = False
-            error_message = str(e)
-        
-        # Create the response
-        result = {
-            "original_curl": curl_command,
-            "is_valid": is_valid
-        }
-        
-        if fixed_data != json_payload:
-            # Replace the JSON in the curl command
-            fixed_curl = curl_command.replace(json_payload, fixed_data)
-            result["fixed_curl"] = fixed_curl
-            result["fixed_json"] = fixed_data
-            
-        if not is_valid:
-            result["error"] = error_message
-            
-        return jsonify(result)
-            
-    except Exception as e:
-        logger.error(f"Error in validate_curl: {str(e)}", exc_info=True)
-        return jsonify({"error": str(e)}), 500
 
 @dataclass
 class TitilerUrlData:
@@ -275,78 +108,6 @@ def extract_and_validate_titiler_url(direct_url):
         
     except Exception as e:
         return None, f"Error validating TiTiler URL: {str(e)}"
-
-def download_from_titiler(titiler_url_data, output_path):
-    """Download a COG from TiTiler."""
-    try:
-        if not titiler_url_data or not titiler_url_data.valid_url:
-            logger.error("Invalid TiTiler URL data")
-            return False
-            
-        # Handle URL-encoded parameters
-        decoded_url = titiler_url_data.valid_url
-        logger.debug(f"Downloading from URL: {decoded_url}")
-        
-        try:
-            # Try to download from TiTiler
-            response = requests.get(decoded_url, stream=True, timeout=5)
-            if response.status_code != 200:
-                logger.warning(f"Failed to download from TiTiler: {response.status_code} - {response.text}")
-                # Fall back to direct file processing
-                if titiler_url_data.local_file_path:
-                    logger.info(f"Falling back to direct file processing")
-                    return process_local_file(
-                        titiler_url_data.local_file_path, 
-                        output_path, 
-                        bbox=titiler_url_data.bbox,
-                        band_indices=titiler_url_data.band_indices,
-                        rescale_values=titiler_url_data.rescale_values
-                    )
-                return False
-            
-            # Write response to file
-            with open(output_path, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    if chunk:  # filter out keep-alive chunks
-                        f.write(chunk)
-            
-            if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
-                logger.debug(f"Successfully downloaded from TiTiler to {output_path}")
-                return True
-            else:
-                logger.warning(f"Download seemed successful but file is empty: {output_path}")
-                # Fall back to direct file processing
-                if titiler_url_data.local_file_path:
-                    logger.info(f"Falling back to direct file processing")
-                    return process_local_file(
-                        titiler_url_data.local_file_path, 
-                        output_path, 
-                        bbox=titiler_url_data.bbox,
-                        band_indices=titiler_url_data.band_indices,
-                        rescale_values=titiler_url_data.rescale_values
-                    )
-                return False
-                
-        except requests.exceptions.RequestException as e:
-            logger.warning(f"TiTiler connection failed: {str(e)}")
-            
-            # Fall back to direct file processing
-            if titiler_url_data.local_file_path:
-                logger.info(f"Falling back to direct file processing")
-                return process_local_file(
-                    titiler_url_data.local_file_path, 
-                    output_path, 
-                    bbox=titiler_url_data.bbox,
-                    band_indices=titiler_url_data.band_indices,
-                    rescale_values=titiler_url_data.rescale_values
-                )
-            else:
-                logger.error("No local file path available for fallback processing")
-                return False
-        
-    except Exception as e:
-        logger.error(f"Error in download_from_titiler: {str(e)}", exc_info=True)
-        return False
 
 def read_full_image(src, bands_to_read, rescale_values=None):
     """Helper function to read full image data."""
@@ -441,6 +202,640 @@ def process_local_file(file_path, output_path, bbox=None, band_indices=None, res
     except Exception as e:
         logger.error(f"Error processing local file: {str(e)}", exc_info=True)
         return False
+
+def download_from_titiler(titiler_url_data, output_path):
+    """Download a COG from TiTiler."""
+    try:
+        if not titiler_url_data or not titiler_url_data.valid_url:
+            logger.error("Invalid TiTiler URL data")
+            return False
+            
+        # Handle URL-encoded parameters
+        decoded_url = titiler_url_data.valid_url
+        logger.debug(f"Downloading from URL: {decoded_url}")
+        
+        try:
+            # Try to download from TiTiler
+            response = requests.get(decoded_url, stream=True, timeout=5)
+            if response.status_code != 200:
+                logger.warning(f"Failed to download from TiTiler: {response.status_code} - {response.text}")
+                # Fall back to direct file processing
+                if titiler_url_data.local_file_path:
+                    logger.info(f"Falling back to direct file processing")
+                    return process_local_file(
+                        titiler_url_data.local_file_path, 
+                        output_path, 
+                        bbox=titiler_url_data.bbox,
+                        band_indices=titiler_url_data.band_indices,
+                        rescale_values=titiler_url_data.rescale_values
+                    )
+                return False
+            
+            # Write response to file
+            with open(output_path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:  # filter out keep-alive chunks
+                        f.write(chunk)
+            
+            if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+                logger.debug(f"Successfully downloaded from TiTiler to {output_path}")
+                return True
+            else:
+                logger.warning(f"Download seemed successful but file is empty: {output_path}")
+                # Fall back to direct file processing
+                if titiler_url_data.local_file_path:
+                    logger.info(f"Falling back to direct file processing")
+                    return process_local_file(
+                        titiler_url_data.local_file_path, 
+                        output_path, 
+                        bbox=titiler_url_data.bbox,
+                        band_indices=titiler_url_data.band_indices,
+                        rescale_values=titiler_url_data.rescale_values
+                    )
+                return False
+                
+        except requests.exceptions.RequestException as e:
+            logger.warning(f"TiTiler connection failed: {str(e)}")
+            
+            # Fall back to direct file processing
+            if titiler_url_data.local_file_path:
+                logger.info(f"Falling back to direct file processing")
+                return process_local_file(
+                    titiler_url_data.local_file_path, 
+                    output_path, 
+                    bbox=titiler_url_data.bbox,
+                    band_indices=titiler_url_data.band_indices,
+                    rescale_values=titiler_url_data.rescale_values
+                )
+            else:
+                logger.error("No local file path available for fallback processing")
+                return False
+        
+    except Exception as e:
+        logger.error(f"Error in download_from_titiler: {str(e)}", exc_info=True)
+        return False
+
+def convert_tiff_to_png(tiff_path, png_path):
+    """Convert a GeoTIFF to PNG format."""
+    with rasterio.open(tiff_path) as src:
+        # Read data
+        if src.count >= 3:
+            # Read as RGB
+            rgb = src.read([1, 2, 3])
+            # Convert to image shape (height, width, channels)
+            rgb = reshape_as_image(rgb)
+        else:
+            # Single band, read as grayscale
+            data = src.read(1)
+            # No need for reshaping for single band
+        
+        # Handle floating point values appropriately
+        if src.count >= 3:
+            # Normalize RGB data if it's floating point
+            if np.issubdtype(rgb.dtype, np.floating):
+                # Check if data has negative values
+                if np.min(rgb) < 0:
+                    # Apply offset and normalization
+                    min_val = np.min(rgb)
+                    rgb = rgb - min_val  # Shift to positive range
+                    max_val = np.max(rgb)
+                    if max_val > 0:
+                        rgb = rgb / max_val  # Normalize to 0-1
+                else:
+                    # Just normalize positive floating point values
+                    max_val = np.max(rgb)
+                    if max_val > 0:
+                        rgb = rgb / max_val
+            elif rgb.dtype != np.uint8:
+                # Convert other integer types to uint8
+                rgb = (rgb / np.iinfo(rgb.dtype).max * 255).astype(np.uint8)
+            
+            plt.imsave(png_path, rgb)
+        else:
+            # Handle single band data
+            if np.issubdtype(data.dtype, np.floating):
+                # For floating point data, normalize
+                if np.min(data) < 0:
+                    min_val = np.min(data)
+                    data = data - min_val
+                    max_val = np.max(data)
+                    if max_val > 0:
+                        data = data / max_val
+                else:
+                    max_val = np.max(data)
+                    if max_val > 0:
+                        data = data / max_val
+            elif data.dtype != np.uint8:
+                # Convert other integer types to 0-1 range
+                data = data.astype(float) / np.iinfo(data.dtype).max
+                
+            plt.imsave(png_path, data, cmap='gray')
+
+def process_animation_frame(frame_config, temp_dir, frame_index):
+    """
+    Process a single animation frame with the given configuration.
+    
+    Args:
+        frame_config: Layer configuration for this frame
+        temp_dir: Temporary directory for processing
+        frame_index: Index of this frame
+        
+    Returns:
+        dict: Frame information including path and metadata
+    """
+    try:
+        # Extract frame properties
+        frame_id = frame_config.get('id', f"frame_{frame_index}")
+        direct_url = frame_config.get('directURL', '')
+        
+        if not direct_url:
+            logger.warning(f"Skipping frame {frame_index}: Missing directURL")
+            return None
+        
+        logger.debug(f"Processing frame {frame_index} from URL: {direct_url}")
+        
+        # Get band indices if provided
+        band_indices = frame_config.get('band_indices')
+        if band_indices and isinstance(band_indices, list):
+            direct_url = modify_url_with_band_indices(direct_url, band_indices)
+            logger.debug(f"Modified URL with band indices {band_indices}: {direct_url}")
+        
+        # Download and process the frame
+        frame_tiff = os.path.join(temp_dir, f"frame_{frame_index}.tiff")
+        frame_png = os.path.join(temp_dir, f"frame_{frame_index}.png")
+        
+        # Validate and extract TiTiler URL
+        url_data, error = extract_and_validate_titiler_url(direct_url)
+        if error:
+            logger.error(f"Invalid TiTiler URL for frame {frame_index}: {error}")
+            return None
+        
+        # Download the frame
+        download_result = download_from_titiler(url_data, frame_tiff)
+        if not download_result:
+            logger.error(f"Failed to download frame {frame_index}")
+            return None
+        
+        # Convert to PNG for animation
+        convert_tiff_to_png(frame_tiff, frame_png)
+        
+        logger.debug(f"Successfully processed frame {frame_index}")
+        
+        return {
+            'file': frame_png,
+            'id': frame_id,
+            'index': frame_index,
+            'metadata': {
+                'date': frame_config.get('date'),
+                'time': frame_config.get('time')
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"Error processing frame {frame_index}: {str(e)}", exc_info=True)
+        return None
+
+def create_animation_from_layers(layers, output_path, temp_dir):
+    """
+    Create an animated GIF from a sequence of layers using multithreading.
+    
+    Args:
+        layers: List of layer objects with directURL properties
+        output_path: Path to save the final GIF
+        temp_dir: Temporary directory for processing
+        
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    try:
+        logger.debug(f"Creating animation from {len(layers)} layers")
+        
+        # Use multithreading to process frames in parallel
+        max_workers = min(len(layers), os.cpu_count() or 4)
+        logger.debug(f"Processing animation frames using {max_workers} threads")
+        
+        frame_results = []
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all frame processing tasks
+            future_to_frame = {
+                executor.submit(process_animation_frame, layer, temp_dir, i): i
+                for i, layer in enumerate(layers)
+            }
+            
+            # Collect results as they complete
+            for future in concurrent.futures.as_completed(future_to_frame):
+                frame_index = future_to_frame[future]
+                frame_info = future.result()
+                
+                if frame_info:
+                    frame_results.append(frame_info)
+                    logger.debug(f"Frame {frame_index} processed successfully")
+                else:
+                    logger.warning(f"Frame {frame_index} processing failed")
+        
+        if not frame_results:
+            logger.error("No frames could be processed for animation")
+            return False
+        
+        # Sort frames by their index to maintain proper sequence
+        frame_results.sort(key=lambda x: x['index'])
+        frame_files = [frame['file'] for frame in frame_results]
+        
+        # Create the animated GIF
+        logger.debug(f"Creating GIF from {len(frame_files)} frames")
+        
+        # Use imageio to create the GIF with 1 second interval
+        with imageio.get_writer(output_path, mode='I', duration=1, loop=0) as writer:
+            for frame_file in frame_files:
+                image = imageio.imread(frame_file)
+                writer.append_data(image)
+        
+        logger.debug(f"Successfully created GIF: {output_path} ({os.path.getsize(output_path)} bytes)")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error creating animation: {str(e)}", exc_info=True)
+        return False
+
+@app.route('/stack-layers', methods=['POST'])
+def stack_layers():
+    """
+    Stack multiple layers based on z-index with transparency.
+    
+    JSON input format:
+    {
+      "directURL": "http://127.0.0.1:8000/cog/bbox/72.02,15.75,100.76,34.22.tif?url=C:/repos/data/3RIMG_{DATE}_{TIME}_L1C_ASIA_MER_V01R00.cog.tif&rescale=0,1000&rescale=0,1000&rescale=0,1000",
+      "date_range": ["2025-03-22", "2025-03-24"],
+      "time_range": ["09:00", "15:00"],
+      "transparency": [0.3, 0.5, 0.8],
+      "zIndex": [1000, 999, 998],
+      "band_indices": [
+        [1, 2, 4],
+        [1, 3, 4],
+        [1, 2, 3]
+      ]
+    }
+    """
+    try:
+        # Get the config from the request with better error handling
+        try:
+            config = request.json
+        except Exception as e:
+            logger.error(f"JSON parsing error: {str(e)}")
+            raw_data = request.get_data(as_text=True)
+            logger.debug(f"Raw request data (first 200 chars): {raw_data[:200]}")
+            return jsonify({
+                "error": "Invalid JSON in request", 
+                "details": str(e),
+                "help": "Please validate your JSON input. Common issues include missing commas, unquoted property names, or trailing commas."
+            }), 400
+        
+        if not config or not isinstance(config, dict):
+            return jsonify({"error": "Invalid input. Expected a configuration object."}), 400
+        
+        # Required fields
+        if 'directURL' not in config:
+            return jsonify({"error": "Missing 'directURL' in configuration"}), 400
+        if 'date_range' not in config or not isinstance(config['date_range'], list) or len(config['date_range']) != 2:
+            return jsonify({"error": "Missing or invalid 'date_range'. Expected format: ['YYYY-MM-DD', 'YYYY-MM-DD']"}), 400
+        if 'time_range' not in config or not isinstance(config['time_range'], list) or len(config['time_range']) != 2:
+            return jsonify({"error": "Missing or invalid 'time_range'. Expected format: ['HH:MM', 'HH:MM']"}), 400
+        
+        # Expand the configuration into individual layers
+        try:
+            layers = expand_config_to_layers(config)
+            logger.debug(f"Expanded configuration to {len(layers)} layers")
+        except Exception as e:
+            logger.error(f"Error expanding configuration: {str(e)}", exc_info=True)
+            return jsonify({"error": f"Error expanding configuration: {str(e)}"}), 400
+        
+        # Now continue with the standard processing using the expanded layers list
+        output_format = request.args.get('format', 'tiff').lower()
+        create_zip = request.args.get('zip', 'no').lower() == 'yes'
+        create_animation = request.args.get('animation', 'no').lower() == 'yes'
+        
+        temp_dir = tempfile.mkdtemp()
+        logger.debug(f"Created temporary directory: {temp_dir}")
+        
+        if create_animation:
+            file_ext = 'gif'
+            output_format = 'gif'
+        elif output_format == 'png':
+            file_ext = 'png'
+        else:
+            file_ext = 'tiff'
+            output_format = 'tiff'
+            
+        output_path = os.path.join(temp_dir, f"stacked_output.{file_ext}")
+        temp_tiff_path = os.path.join(temp_dir, "stacked_output_temp.tiff")
+        
+        if create_animation:
+            animation_result = create_animation_from_layers(layers, output_path, temp_dir)
+            if not animation_result:
+                logger.error("Failed to create animation.")
+                return jsonify({"error": "Failed to create animation."}), 500
+            
+            logger.debug(f"Successfully created animation: {output_path} ({os.path.getsize(output_path)} bytes)")
+            return send_file(output_path, mimetype='image/gif',
+                           as_attachment=True, download_name="animation.gif")
+        
+        sorted_layers = sorted(layers, key=lambda x: x.get('zIndex', 0))
+        logger.debug(f"Processing {len(sorted_layers)} layers")
+        
+        processed_layers = []
+        reference_lock = Lock()
+        reference_data = {
+            'transform': None,
+            'crs': None,
+            'width': None,
+            'height': None,
+            'bbox': None
+        }
+        
+        def process_layer(layer_index, layer):
+            try:
+                layer_id = layer.get('id', f"layer_{layer_index}")
+                direct_url = layer.get('directURL', '')
+                transparency = float(layer.get('transparency', 1.0))
+                
+                if not direct_url:
+                    logger.warning(f"Skipping layer {layer_id}: Missing directURL.")
+                    return None
+                
+                logger.debug(f"Processing layer {layer_id} with transparency {transparency} and zIndex {layer.get('zIndex')}")
+                
+                # If band indices are provided in the layer, modify the URL
+                band_indices = layer.get('band_indices')
+                if band_indices and isinstance(band_indices, list):
+                    direct_url = modify_url_with_band_indices(direct_url, band_indices)
+                    logger.debug(f"Modified URL with band indices {band_indices}: {direct_url}")
+                
+                url_data, error = extract_and_validate_titiler_url(direct_url)
+                if error:
+                    logger.error(f"Invalid TiTiler URL for layer {layer_id}: {error}")
+                    return None
+                
+                layer_file = os.path.join(temp_dir, f"layer_{layer_id}.tiff")
+                download_result = download_from_titiler(url_data, layer_file)
+                if not download_result:
+                    logger.error(f"Failed to download/process layer {layer_id}")
+                    return None
+                
+                if not os.path.exists(layer_file) or os.path.getsize(layer_file) < 100:
+                    logger.error(f"Layer file is missing or too small: {layer_file}")
+                    return None
+                
+                try:
+                    with rasterio.open(layer_file) as src:
+                        with reference_lock:
+                            if reference_data['transform'] is None:
+                                reference_data['transform'] = src.transform
+                                reference_data['crs'] = src.crs
+                                reference_data['width'] = src.width
+                                reference_data['height'] = src.height
+                                reference_data['bbox'] = src.bounds
+                                logger.debug(f"Reference layer set: {src.width}x{src.height}, CRS: {src.crs}")
+                        
+                        return {
+                            'file': layer_file,
+                            'transparency': transparency,
+                            'id': layer_id
+                        }
+                        
+                except rasterio.errors.RasterioIOError as e:
+                    logger.error(f"Failed to open raster file for layer {layer_id}: {str(e)}")
+                    return None
+                
+            except Exception as e:
+                logger.error(f"Error processing layer {layer.get('id', f'layer_{layer_index}')}: {str(e)}", exc_info=True)
+                return None
+        
+        max_workers = min(len(sorted_layers), os.cpu_count() or 4)
+        logger.debug(f"Processing layers using {max_workers} threads")
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all tasks to the executor
+            future_to_layer = {
+                executor.submit(process_layer, i, layer): (i, layer) 
+                for i, layer in enumerate(sorted_layers)
+            }
+            
+            # Process results as they complete
+            for future in concurrent.futures.as_completed(future_to_layer):
+                layer_info = future.result()
+                if layer_info:
+                    processed_layers.append(layer_info)
+        
+        if not processed_layers:
+            logger.error("No layers could be processed.")
+            return jsonify({"error": "No layers could be processed."}), 400
+        
+        logger.debug(f"Successfully processed {len(processed_layers)} layers out of {len(sorted_layers)}")
+        
+        if reference_data['transform'] is None and processed_layers:
+            with rasterio.open(processed_layers[0]['file']) as src:
+                reference_data['transform'] = src.transform
+                reference_data['crs'] = src.crs
+                reference_data['width'] = src.width
+                reference_data['height'] = src.height
+                reference_data['bbox'] = src.bounds
+        
+        stack_result = stack_layers_with_transparency(
+            processed_layers,
+            temp_tiff_path,
+            reference_data['transform'],
+            reference_data['crs'],
+            reference_data['width'],
+            reference_data['height']
+        )
+        
+        if not stack_result:
+            logger.error("Failed to stack layers.")
+            return jsonify({"error": "Failed to stack layers."}), 500
+        
+        logger.debug(f"Successfully stacked layers to {temp_tiff_path} ({os.path.getsize(temp_tiff_path)} bytes)")
+        
+        if output_format == 'png':
+            convert_tiff_to_png(temp_tiff_path, output_path)
+            logger.debug(f"Converted to PNG: {output_path} ({os.path.getsize(output_path)} bytes)")
+        else:
+            shutil.copy(temp_tiff_path, output_path)
+            logger.debug(f"Copied to output: {output_path} ({os.path.getsize(output_path)} bytes)")
+        
+        if create_zip:
+            logger.debug("Creating ZIP file with all layers and result")
+            zip_path = os.path.join(temp_dir, "stacked_layers_package.zip")
+            
+            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                zipf.write(output_path, os.path.basename(output_path))
+                
+                for layer in processed_layers:
+                    layer_filename = os.path.basename(layer['file'])
+                    zipf.write(layer['file'], f"raw_layers/{layer['id']}_{layer_filename}")
+            
+            logger.debug(f"Created ZIP file: {zip_path} ({os.path.getsize(zip_path)} bytes)")
+            return send_file(zip_path, mimetype='application/zip',
+                           as_attachment=True, download_name="stacked_layers_package.zip")
+        else:
+            return send_file(output_path, mimetype=f'image/{file_ext}', 
+                            as_attachment=True, download_name=f"stacked_layers.{file_ext}")
+    
+    except Exception as e:
+        logger.error(f"General error in stack_layers: {str(e)}", exc_info=True)
+        error_details = {
+            "error": str(e),
+            "type": type(e).__name__
+        }
+        if app.debug:
+            error_details["traceback"] = traceback.format_exc()
+        return jsonify(error_details), 500
+    
+    finally:
+        if 'temp_dir' in locals():
+            logger.debug(f"Cleaning up temporary directory: {temp_dir}")
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+def expand_config_to_layers(config):
+    """
+    Expands the configuration with date/time ranges into individual layer configurations.
+    
+    Args:
+        config: Dictionary with directURL, date_range, time_range and optional parameters
+        
+    Returns:
+        list: List of expanded layer configurations
+    """
+    # Extract configuration parameters
+    url_template = config['directURL']
+    date_range = config['date_range']
+    time_range = config['time_range']
+    
+    # Get optional parameters with defaults
+    transparencies = config.get('transparency', [1.0])
+    if not isinstance(transparencies, list):
+        transparencies = [transparencies]
+    
+    z_indices = config.get('zIndex', [1000])
+    if not isinstance(z_indices, list):
+        z_indices = [z_indices]
+    
+    band_indices_list = config.get('band_indices', None)
+    if band_indices_list:
+        if not isinstance(band_indices_list, list):
+            band_indices_list = [band_indices_list]
+        elif band_indices_list and not isinstance(band_indices_list[0], list):
+            band_indices_list = [band_indices_list]  # Wrap single band config in a list
+    
+    # Generate date sequence
+    try:
+        start_date = datetime.strptime(date_range[0], '%Y-%m-%d')
+        end_date = datetime.strptime(date_range[1], '%Y-%m-%d')
+        
+        date_sequence = []
+        current_date = start_date
+        while current_date <= end_date:
+            # Format date as DDMMMYYYY (e.g. 22MAR2025)
+            date_formatted = current_date.strftime('%d%b%Y').upper()
+            date_sequence.append((current_date.strftime('%Y-%m-%d'), date_formatted))
+            current_date += timedelta(days=1)
+        
+        logger.debug(f"Generated date sequence: {date_sequence}")
+    except Exception as e:
+        logger.error(f"Error generating date sequence: {str(e)}")
+        raise ValueError(f"Invalid date format. Expected YYYY-MM-DD, got: {date_range}")
+    
+    # Generate time sequence (hourly increments)
+    try:
+        start_time = datetime.strptime(time_range[0], '%H:%M')
+        end_time = datetime.strptime(time_range[1], '%H:%M')
+        
+        time_sequence = []
+        current_time = start_time
+        while current_time <= end_time:
+            # Format time as HHMM (e.g. 0915)
+            time_formatted = current_time.strftime('%H%M')
+            time_sequence.append((current_time.strftime('%H:%M'), time_formatted))
+            current_time += timedelta(hours=1)
+        
+        logger.debug(f"Generated time sequence: {time_sequence}")
+    except Exception as e:
+        logger.error(f"Error generating time sequence: {str(e)}")
+        raise ValueError(f"Invalid time format. Expected HH:MM, got: {time_range}")
+    
+    # Generate all combinations
+    layers = []
+    parameter_index = 0
+    
+    for (date_original, date_formatted), (time_original, time_formatted) in itertools.product(date_sequence, time_sequence):
+        # Replace placeholders in URL with the properly formatted values
+        direct_url = url_template.replace('{DATE}', date_formatted).replace('{TIME}', time_formatted)
+        
+        # Get parameters for this layer (cycling through available values)
+        transparency = transparencies[parameter_index % len(transparencies)]
+        z_index = z_indices[parameter_index % len(z_indices)]
+        
+        # Create the layer configuration
+        layer = {
+            'id': f"layer_{date_original}_{time_original.replace(':', '')}",
+            'directURL': direct_url,
+            'transparency': transparency,
+            'zIndex': z_index,
+            'date': date_original,
+            'time': time_original
+        }
+        
+        # Add band indices if provided
+        if band_indices_list:
+            band_index_set = band_indices_list[parameter_index % len(band_indices_list)]
+            layer['band_indices'] = band_index_set
+        
+        layers.append(layer)
+        parameter_index += 1
+    
+    logger.debug(f"Expanded to {len(layers)} layer configurations")
+    return layers
+
+def modify_url_with_band_indices(url, band_indices):
+    """
+    Modifies a TiTiler URL to include the specified band indices.
+    
+    Args:
+        url: Original TiTiler URL
+        band_indices: List of band indices to use [1, 2, 3]
+        
+    Returns:
+        str: Modified URL with band indices
+    """
+    # Parse the URL
+    parsed_url = urlparse(url)
+    query_params = parse_qs(parsed_url.query)
+    
+    # Remove any existing bidx parameters
+    if 'bidx' in query_params:
+        del query_params['bidx']
+    
+    # Add new bidx parameters
+    bidx_params = []
+    for idx in band_indices:
+        bidx_params.append(('bidx', str(idx)))
+    
+    # Reconstruct query string
+    query_items = []
+    for key, values in query_params.items():
+        for value in values:
+            query_items.append(f"{key}={value}")
+    
+    # Add band indices
+    for key, value in bidx_params:
+        query_items.append(f"{key}={value}")
+    
+    # Reconstruct URL
+    query_string = "&".join(query_items)
+    url_parts = list(parsed_url)
+    url_parts[4] = query_string
+    
+    return urlunparse(url_parts)
 
 def stack_layers_with_transparency(layers, output_path, transform, crs, width, height):
     """Stack multiple layers with transparency using vectorized operations."""
@@ -550,354 +945,6 @@ def stack_layers_with_transparency(layers, output_path, transform, crs, width, h
     except Exception as e:
         logger.error(f"Error stacking layers: {str(e)}", exc_info=True)
         return False
-
-def convert_tiff_to_png(tiff_path, png_path):
-    """Convert a GeoTIFF to PNG format."""
-    with rasterio.open(tiff_path) as src:
-        # Read data
-        if src.count >= 3:
-            # Read as RGB
-            rgb = src.read([1, 2, 3])
-            # Convert to image shape (height, width, channels)
-            rgb = reshape_as_image(rgb)
-        else:
-            # Single band, read as grayscale
-            data = src.read(1)
-            # No need for reshaping for single band
-        
-        # Handle floating point values appropriately
-        if src.count >= 3:
-            # Normalize RGB data if it's floating point
-            if np.issubdtype(rgb.dtype, np.floating):
-                # Check if data has negative values
-                if np.min(rgb) < 0:
-                    # Apply offset and normalization
-                    min_val = np.min(rgb)
-                    rgb = rgb - min_val  # Shift to positive range
-                    max_val = np.max(rgb)
-                    if max_val > 0:
-                        rgb = rgb / max_val  # Normalize to 0-1
-                else:
-                    # Just normalize positive floating point values
-                    max_val = np.max(rgb)
-                    if max_val > 0:
-                        rgb = rgb / max_val
-            elif rgb.dtype != np.uint8:
-                # Convert other integer types to uint8
-                rgb = (rgb / np.iinfo(rgb.dtype).max * 255).astype(np.uint8)
-            
-            plt.imsave(png_path, rgb)
-        else:
-            # Handle single band data
-            if np.issubdtype(data.dtype, np.floating):
-                # For floating point data, normalize
-                if np.min(data) < 0:
-                    min_val = np.min(data)
-                    data = data - min_val
-                    max_val = np.max(data)
-                    if max_val > 0:
-                        data = data / max_val
-                else:
-                    max_val = np.max(data)
-                    if max_val > 0:
-                        data = data / max_val
-            elif data.dtype != np.uint8:
-                # Convert other integer types to 0-1 range
-                data = data.astype(float) / np.iinfo(data.dtype).max
-                
-            plt.imsave(png_path, data, cmap='gray')
-
-def create_animation_from_layers(layers, output_path, temp_dir):
-    """
-    Create an animated GIF from a sequence of layers.
-    
-    Args:
-        layers: List of layer objects with directURL properties
-        output_path: Path to save the final GIF
-        temp_dir: Temporary directory for processing
-        
-    Returns:
-        bool: True if successful, False otherwise
-    """
-    try:
-        logger.debug("Creating animation from layers")
-        
-        # Process each frame
-        frame_files = []
-        
-        for i, layer in enumerate(layers):
-            try:
-                # Extract layer properties
-                layer_id = layer.get('id', f"frame_{i}")
-                direct_url = layer.get('directURL', '')
-                
-                if not direct_url:
-                    logger.warning(f"Skipping frame {i}: Missing directURL")
-                    continue
-                
-                # Process the frame
-                logger.debug(f"Processing frame {i} from URL: {direct_url}")
-                
-                # Download and process the frame
-                frame_tiff = os.path.join(temp_dir, f"frame_{i}.tiff")
-                frame_png = os.path.join(temp_dir, f"frame_{i}.png")
-                
-                # Validate and extract TiTiler URL
-                url_data, error = extract_and_validate_titiler_url(direct_url)
-                if error:
-                    logger.error(f"Invalid TiTiler URL for frame {i}: {error}")
-                    continue
-                
-                # Download the frame
-                download_result = download_from_titiler(url_data, frame_tiff)
-                if not download_result:
-                    logger.error(f"Failed to download frame {i}")
-                    continue
-                
-                # Convert to PNG for animation
-                convert_tiff_to_png(frame_tiff, frame_png)
-                frame_files.append(frame_png)
-                
-                logger.debug(f"Successfully processed frame {i}")
-                
-            except Exception as e:
-                logger.error(f"Error processing frame {i}: {str(e)}", exc_info=True)
-                continue
-        
-        if not frame_files:
-            logger.error("No frames could be processed for animation")
-            return False
-            
-        # Create the animated GIF
-        logger.debug(f"Creating GIF from {len(frame_files)} frames")
-        
-        # Use imageio to create the GIF with 1 second interval
-        with imageio.get_writer(output_path, mode='I', duration=1, loop=0) as writer:
-            for frame_file in frame_files:
-                image = imageio.imread(frame_file)
-                writer.append_data(image)
-        
-        logger.debug(f"Successfully created GIF: {output_path}")
-        return True
-        
-    except Exception as e:
-        logger.error(f"Error creating animation: {str(e)}", exc_info=True)
-        return False
-
-@app.route('/stack-layers', methods=['POST'])
-def stack_layers():
-    """
-    Stack multiple layers based on z-index with transparency.
-    
-    Simplified JSON input:
-    [
-        {
-            "transparency": 1.0,
-            "zIndex": 1000,
-            "directURL": "http://titiler_url/cog/bbox/minx,miny,maxx,maxy.tif?parameters"
-        },
-        ...
-    ]
-    """
-    try:
-        # Get the layers from the request with better error handling
-        try:
-            layers = request.json
-        except Exception as e:
-            logger.error(f"JSON parsing error: {str(e)}")
-            raw_data = request.get_data(as_text=True)
-            logger.debug(f"Raw request data (first 200 chars): {raw_data[:200]}")
-            return jsonify({
-                "error": "Invalid JSON in request", 
-                "details": str(e),
-                "help": "Please validate your JSON input. Common issues include missing commas, unquoted property names, or trailing commas."
-            }), 400
-        
-        if not layers or not isinstance(layers, list):
-            return jsonify({"error": "Invalid input. Expected a list of layers."}), 400
-        
-        output_format = request.args.get('format', 'tiff').lower()
-        create_zip = request.args.get('zip', 'no').lower() == 'yes'
-        create_animation = request.args.get('animation', 'no').lower() == 'yes'
-        
-        if not create_animation:
-            for layer in layers:
-                if layer.get('animation', '').lower() == 'yes' or layer.get('animation', False) is True:
-                    create_animation = True
-                    break
-        
-        temp_dir = tempfile.mkdtemp()
-        logger.debug(f"Created temporary directory: {temp_dir}")
-        
-        if create_animation:
-            file_ext = 'gif'
-            output_format = 'gif'
-        elif output_format == 'png':
-            file_ext = 'png'
-        else:
-            file_ext = 'tiff'
-            output_format = 'tiff'
-            
-        output_path = os.path.join(temp_dir, f"stacked_output.{file_ext}")
-        temp_tiff_path = os.path.join(temp_dir, "stacked_output_temp.tiff")
-        
-        if create_animation:
-            animation_result = create_animation_from_layers(layers, output_path, temp_dir)
-            if not animation_result:
-                logger.error("Failed to create animation.")
-                return jsonify({"error": "Failed to create animation."}), 500
-            
-            logger.debug(f"Successfully created animation: {output_path} ({os.path.getsize(output_path)} bytes)")
-            return send_file(output_path, mimetype='image/gif',
-                           as_attachment=True, download_name="animation.gif")
-        
-        sorted_layers = sorted(layers, key=lambda x: x.get('zIndex', 0))
-        logger.debug(f"Processing {len(sorted_layers)} layers")
-        
-        processed_layers = []
-        reference_lock = Lock()
-        reference_data = {
-            'transform': None,
-            'crs': None,
-            'width': None,
-            'height': None,
-            'bbox': None
-        }
-        
-        def process_layer(layer_index, layer):
-            try:
-                layer_id = layer.get('id', f"layer_{layer_index}")
-                direct_url = layer.get('directURL', '')
-                transparency = float(layer.get('transparency', 1.0))
-                
-                if not direct_url:
-                    logger.warning(f"Skipping layer {layer_id}: Missing directURL.")
-                    return None
-                
-                logger.debug(f"Processing layer {layer_id} with transparency {transparency} and zIndex {layer.get('zIndex')}")
-                
-                url_data, error = extract_and_validate_titiler_url(direct_url)
-                if error:
-                    logger.error(f"Invalid TiTiler URL for layer {layer_id}: {error}")
-                    return None
-                
-                layer_file = os.path.join(temp_dir, f"layer_{layer_id}.tiff")
-                download_result = download_from_titiler(url_data, layer_file)
-                if not download_result:
-                    logger.error(f"Failed to download/process layer {layer_id}")
-                    return None
-                
-                if not os.path.exists(layer_file) or os.path.getsize(layer_file) < 100:
-                    logger.error(f"Layer file is missing or too small: {layer_file}")
-                    return None
-                
-                try:
-                    with rasterio.open(layer_file) as src:
-                        with reference_lock:
-                            if reference_data['transform'] is None:
-                                reference_data['transform'] = src.transform
-                                reference_data['crs'] = src.crs
-                                reference_data['width'] = src.width
-                                reference_data['height'] = src.height
-                                reference_data['bbox'] = src.bounds
-                                logger.debug(f"Reference layer set: {src.width}x{src.height}, CRS: {src.crs}")
-                        
-                        return {
-                            'file': layer_file,
-                            'transparency': transparency,
-                            'id': layer_id
-                        }
-                        
-                except rasterio.errors.RasterioIOError as e:
-                    logger.error(f"Failed to open raster file for layer {layer_id}: {str(e)}")
-                    return None
-                
-            except Exception as e:
-                logger.error(f"Error processing layer {layer.get('id', f'layer_{layer_index}')}: {str(e)}", exc_info=True)
-                return None
-        
-        max_workers = min(len(sorted_layers), os.cpu_count() or 4)
-        logger.debug(f"Processing layers using {max_workers} threads")
-        
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_layer = {
-                executor.submit(process_layer, i, layer): (i, layer) 
-                for i, layer in enumerate(sorted_layers)
-            }
-            
-            for future in concurrent.futures.as_completed(future_to_layer):
-                layer_info = future.result()
-                if layer_info:
-                    processed_layers.append(layer_info)
-        
-        if not processed_layers:
-            logger.error("No layers could be processed.")
-            return jsonify({"error": "No layers could be processed."}), 400
-        
-        logger.debug(f"Successfully processed {len(processed_layers)} layers out of {len(sorted_layers)}")
-        
-        if reference_data['transform'] is None and processed_layers:
-            with rasterio.open(processed_layers[0]['file']) as src:
-                reference_data['transform'] = src.transform
-                reference_data['crs'] = src.crs
-                reference_data['width'] = src.width
-                reference_data['height'] = src.height
-                reference_data['bbox'] = src.bounds
-        
-        stack_result = stack_layers_with_transparency(
-            processed_layers,
-            temp_tiff_path,
-            reference_data['transform'],
-            reference_data['crs'],
-            reference_data['width'],
-            reference_data['height']
-        )
-        
-        if not stack_result:
-            logger.error("Failed to stack layers.")
-            return jsonify({"error": "Failed to stack layers."}), 500
-        
-        logger.debug(f"Successfully stacked layers to {temp_tiff_path} ({os.path.getsize(temp_tiff_path)} bytes)")
-        
-        if output_format == 'png':
-            convert_tiff_to_png(temp_tiff_path, output_path)
-            logger.debug(f"Converted to PNG: {output_path} ({os.path.getsize(output_path)} bytes)")
-        else:
-            shutil.copy(temp_tiff_path, output_path)
-            logger.debug(f"Copied to output: {output_path} ({os.path.getsize(output_path)} bytes)")
-        
-        if create_zip:
-            logger.debug("Creating ZIP file with all layers and result")
-            zip_path = os.path.join(temp_dir, "stacked_layers_package.zip")
-            
-            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-                zipf.write(output_path, os.path.basename(output_path))
-                
-                for layer in processed_layers:
-                    layer_filename = os.path.basename(layer['file'])
-                    zipf.write(layer['file'], f"raw_layers/{layer['id']}_{layer_filename}")
-            
-            logger.debug(f"Created ZIP file: {zip_path} ({os.path.getsize(zip_path)} bytes)")
-            return send_file(zip_path, mimetype='application/zip',
-                           as_attachment=True, download_name="stacked_layers_package.zip")
-        else:
-            return send_file(output_path, mimetype=f'image/{file_ext}', 
-                            as_attachment=True, download_name=f"stacked_layers.{file_ext}")
-    
-    except Exception as e:
-        logger.error(f"General error in stack_layers: {str(e)}", exc_info=True)
-        error_details = {
-            "error": str(e),
-            "type": type(e).__name__
-        }
-        if app.debug:
-            error_details["traceback"] = traceback.format_exc()
-        return jsonify(error_details), 500
-    
-    finally:
-        if 'temp_dir' in locals():
-            logger.debug(f"Cleaning up temporary directory: {temp_dir}")
-            shutil.rmtree(temp_dir, ignore_errors=True)
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000)
