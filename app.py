@@ -25,14 +25,14 @@ from threading import Lock
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 import itertools
-
+from flasgger import Swagger
 # Configure logging
 logging.basicConfig(level=logging.DEBUG, 
                    format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-
+swagger = Swagger(app)
 @dataclass
 class TitilerUrlData:
     """Class for storing extracted data from TiTiler URLs"""
@@ -461,21 +461,100 @@ def create_animation_from_layers(layers, output_path, temp_dir):
 @app.route('/stack-layers', methods=['POST'])
 def stack_layers():
     """
-    Stack multiple layers based on z-index with transparency.
-    
-    JSON input format:
-    {
-      "directURL": "http://127.0.0.1:8000/cog/bbox/72.02,15.75,100.76,34.22.tif?url=C:/repos/data/3RIMG_{DATE}_{TIME}_L1C_ASIA_MER_V01R00.cog.tif&rescale=0,1000&rescale=0,1000&rescale=0,1000",
-      "date_range": ["2025-03-22", "2025-03-24"],
-      "time_range": ["09:00", "15:00"],
-      "transparency": [0.3, 0.5, 0.8],
-      "zIndex": [1000, 999, 998],
-      "band_indices": [
-        [1, 2, 4],
-        [1, 3, 4],
-        [1, 2, 3]
-      ]
-    }
+    Stack or animate geospatial raster layers with transparency and z-index.
+
+    ---
+    tags:
+      - Raster Layer Processing
+    consumes:
+      - application/json
+    produces:
+      - image/png
+      - image/gif
+      - application/zip
+    parameters:
+      - in: query
+        name: format
+        type: string
+        required: false
+        enum: [tiff, png]
+        default: tiff
+        description: Output format (TIFF or PNG). Ignored if `animation=yes`.
+      - in: query
+        name: zip
+        type: string
+        required: false
+        enum: [yes, no]
+        description: Whether to return a ZIP file containing all input layers and the output.
+      - in: query
+        name: animation
+        type: string
+        required: false
+        enum: [yes, no]
+        description: Whether to generate an animated GIF using time frames.
+      - in: body
+        name: body
+        required: true
+        description: Configuration object for stacking or animation
+        schema:
+          type: object
+          required:
+            - directURL
+            - date_range
+            - time_range
+          properties:
+            directURL:
+              type: string
+              example: "http://127.0.0.1:8000/cog/bbox/72.02,15.75,100.76,34.22.tif?url=/path/to/3RIMG_{DATE}_{TIME}.tif&bidx=1&bidx=3&bidx=4"
+            date_range:
+              type: array
+              items:
+                type: string
+              example: ["2025-03-22", "2025-03-24"]
+            time_range:
+              type: array
+              items:
+                type: string
+              example: ["09:00", "15:00"]
+            transparency:
+              type: array
+              items:
+                type: number
+                minimum: 0
+                maximum: 1
+              example: [0.3, 0.5, 0.7]
+            zIndex:
+              type: array
+              items:
+                type: integer
+              example: [1000, 999, 998]
+            band_indices:
+              type: array
+              items:
+                type: array
+                items:
+                  type: integer
+              example: [[1, 2, 3], [1, 3, 4]]
+    responses:
+      200:
+        description: Successfully generated image (or ZIP/GIF depending on query)
+        content:
+          image/png:
+            schema:
+              type: string
+              format: binary
+          image/gif:
+            schema:
+              type: string
+              format: binary
+          application/zip:
+            schema:
+              type: string
+              format: binary
+      400:
+        description: Bad request – Invalid config or no layers processed
+      500:
+        description: Internal server error – Failed during processing
     """
     try:
         # Get the config from the request with better error handling
