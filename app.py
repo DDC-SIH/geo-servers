@@ -12,8 +12,10 @@ from flask import Flask, request, jsonify, send_file
 from concurrent.futures import ThreadPoolExecutor
 import zipfile
 import matplotlib.pyplot as plt
+from flasgger import Swagger, swag_from
 
 app = Flask(__name__)
+swagger = Swagger(app)
 
 def download_from_titiler(url, output_path):
     response = requests.get(url, stream=True)
@@ -25,6 +27,37 @@ def download_from_titiler(url, output_path):
         raise Exception(f"Failed to download {url}")
 
 @app.route('/download/raw', methods=['POST'])
+@swag_from({
+    'tags': ['Download'],
+    'description': 'Download multiple raster layers from direct TiTiler URLs and zip them.',
+    'parameters': [
+        {
+            'name': 'body',
+            'in': 'body',
+            'required': True,
+            'schema': {
+                'type': 'array',
+                'items': {
+                    'type': 'string',
+                    'example': 'http://127.0.0.1:8000/cog/bbox/72.0,15.0,78.0,25.0.tif?url=/path/to/file.cog.tif&bidx=1&bidx=2&bidx=3'
+                }
+            }
+        }
+    ],
+    'responses': {
+        200: {
+            'description': 'Zipped file of all layers',
+            'content': {
+                'application/zip': {
+                    'schema': {
+                        'type': 'string',
+                        'format': 'binary'
+                    }
+                }
+            }
+        }
+    }
+})
 def download_raw_layers():
     try:
         urls = request.json
@@ -57,6 +90,42 @@ def download_raw_layers():
             shutil.rmtree(temp_dir, ignore_errors=True)
 
 @app.route('/download/layered', methods=['POST'])
+@swag_from({
+    'tags': ['Download'],
+    'description': 'Download and stack multiple raster layers using alpha transparency and zIndex.',
+    'parameters': [
+        {
+            'name': 'body',
+            'in': 'body',
+            'required': True,
+            'schema': {
+                'type': 'array',
+                'items': {
+                    'type': 'object',
+                    'properties': {
+                        'directURL': {'type': 'string', 'example': 'http://127.0.0.1:8000/cog/bbox/72.0,15.0,78.0,25.0.tif?url=/path/file.cog.tif'},
+                        'zIndex': {'type': 'integer', 'example': 1},
+                        'transparency': {'type': 'number', 'format': 'float', 'example': 0.7}
+                    },
+                    'required': ['directURL']
+                }
+            }
+        }
+    ],
+    'responses': {
+        200: {
+            'description': 'Stacked raster image',
+            'content': {
+                'image/tiff': {
+                    'schema': {
+                        'type': 'string',
+                        'format': 'binary'
+                    }
+                }
+            }
+        }
+    }
+})
 def stack_layers():
     try:
         layers = request.json
