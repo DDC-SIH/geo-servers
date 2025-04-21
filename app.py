@@ -13,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 import zipfile
 import matplotlib.pyplot as plt
 from flasgger import Swagger, swag_from
+from PIL import Image
 
 app = Flask(__name__)
 swagger = Swagger(app)
@@ -99,16 +100,28 @@ def download_raw_layers():
             'in': 'body',
             'required': True,
             'schema': {
-                'type': 'array',
-                'items': {
-                    'type': 'object',
-                    'properties': {
-                        'directURL': {'type': 'string', 'example': 'http://127.0.0.1:8000/cog/bbox/72.0,15.0,78.0,25.0.tif?url=/path/file.cog.tif'},
-                        'zIndex': {'type': 'integer', 'example': 1},
-                        'transparency': {'type': 'number', 'format': 'float', 'example': 0.7}
-                    },
-                    'required': ['directURL']
-                }
+                'type': 'object',
+                'properties': {
+                    'format': {
+    'type': 'string',
+    'example': 'png',
+    'enum': ['tiff', 'tif', 'png', 'jpeg', 'jpg', 'webp', 'npy'],
+    'description': 'Supported formats: tiff, tif, png, jpeg, jpg, webp, npy'
+},
+                    'data': {
+                        'type': 'array',
+                        'items': {
+                            'type': 'object',
+                            'properties': {
+                                'directURL': {'type': 'string'},
+                                'zIndex': {'type': 'integer'},
+                                'transparency': {'type': 'number', 'format': 'float'}
+                            },
+                            'required': ['directURL']
+                        }
+                    }
+                },
+                'required': ['data']
             }
         }
     ],
@@ -116,7 +129,7 @@ def download_raw_layers():
         200: {
             'description': 'Stacked raster image',
             'content': {
-                'image/tiff': {
+                '*/*': {
                     'schema': {
                         'type': 'string',
                         'format': 'binary'
@@ -128,12 +141,18 @@ def download_raw_layers():
 })
 def stack_layers():
     try:
-        layers = request.json
+        req = request.json
+        if not req or not isinstance(req, dict) or 'data' not in req:
+            return jsonify({"error": "Expected a JSON object with 'data' list and optional 'format'."}), 400
+
+        layers = req['data']
+        output_format = req.get('format', 'tiff').lower()
+
         if not layers or not isinstance(layers, list):
-            return jsonify({"error": "Expected a list of layer objects."}), 400
+            return jsonify({"error": "'data' should be a list of layer objects."}), 400
 
         temp_dir = tempfile.mkdtemp()
-        output_path = os.path.join(temp_dir, "stacked_output.tiff")
+        output_path = os.path.join(temp_dir, f"stacked_output.{output_format if output_format != 'tif' else 'tiff'}")
 
         sorted_layers = sorted(layers, key=lambda x: x.get('zIndex', 0))
 
@@ -191,22 +210,36 @@ def stack_layers():
 
                 stacked_data[..., 3] = (out_alpha * 255).astype(np.uint8)
 
-        rgb_data = stacked_data[..., :3].transpose(2, 0, 1)
+        rgb_data = stacked_data[..., :3]
 
-        with rasterio.open(
-            output_path,
-            'w',
-            driver='GTiff',
-            height=ref_height,
-            width=ref_width,
-            count=3,
-            dtype=rgb_data.dtype,
-            crs=ref_crs,
-            transform=ref_transform
-        ) as dst:
-            dst.write(rgb_data)
+        if output_format in ["tiff", "tif"]:
+            rgb_data = rgb_data.transpose(2, 0, 1)
+            with rasterio.open(
+                output_path,
+                'w',
+                driver='GTiff',
+                height=ref_height,
+                width=ref_width,
+                count=3,
+                dtype=rgb_data.dtype,
+                crs=ref_crs,
+                transform=ref_transform
+            ) as dst:
+                dst.write(rgb_data)
 
-        return send_file(output_path, as_attachment=True, download_name="stacked_layers.tiff")
+        elif output_format in ["jpeg", "jpg", "png", "webp"]:
+            image = Image.fromarray(rgb_data)
+            save_format = "JPEG" if output_format == "jpg" else output_format.upper()
+            image.save(output_path, format=save_format)
+
+
+        elif output_format == "npy":
+            np.save(output_path, rgb_data)
+
+        else:
+            return jsonify({"error": f"Unsupported format: {output_format}"}), 400
+
+        return send_file(output_path, as_attachment=True, download_name=f"stacked_layers.{output_format}")
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
