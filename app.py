@@ -14,9 +14,121 @@ import zipfile
 import matplotlib.pyplot as plt
 from flasgger import Swagger, swag_from
 from PIL import Image
+from flask_cors import CORS
+from flask import Flask, request, jsonify, send_file
+from io import BytesIO
+import os
+import requests
+import datetime
+from PIL import Image
+from typing import List
+
 
 app = Flask(__name__)
+CORS(app)
 swagger = Swagger(app)
+TITILER_BASE = "http://74.226.242.56:8000/cog"
+METADATA_API = "http://74.226.242.56:7000/api/metadata/{sat}/cog/range"
+
+def convert_epoch_to_datetime(epoch_ms: int) -> datetime.datetime:
+    return datetime.datetime.fromtimestamp(epoch_ms / 1000)
+
+def get_filtered_cogs(input_data: dict) -> List[dict]:
+    start = datetime.datetime.fromisoformat(input_data["startDateTime"])
+    end = datetime.datetime.fromisoformat(input_data["endDateTime"])
+    interval = int(input_data["interval"])
+
+    url = METADATA_API.format(sat=input_data["SatelliteId"])
+    params = {
+        "start": input_data["startDateTime"],
+        "end": input_data["endDateTime"],
+        "processingLevel": input_data["processingLevel"],
+        "productCode": input_data["productType"],
+        "type": input_data["bandName"]
+    }
+
+    print(f"Fetching metadata from: {url} with params: {params}")
+    response = requests.get(url, params=params)
+    response.raise_for_status()
+    cogs = response.json().get("cogs", [])
+    print(f"Received {len(cogs)} COGs")
+
+    sorted_cogs = sorted(cogs, key=lambda c: c["aquisition_datetime"])
+    selected = []
+    current_time = start
+
+    for cog in sorted_cogs:
+        cog_time = convert_epoch_to_datetime(cog["aquisition_datetime"])
+        if cog_time >= current_time and cog_time <= end:
+            selected.append(cog)
+            current_time = cog_time + datetime.timedelta(hours=interval)
+
+    print(f"Selected {len(selected)} COGs for processing")
+    return selected
+
+def generate_titiler_url(cog: dict, input_data: dict) -> str:
+    # print(f"Generating TiTiler URL for COG: {cog}")
+    bbox = input_data.get("bbox")
+    print(f"Using bbox: {bbox}" if bbox else "No bbox provided, using preview")
+    color_map = input_data["colourmap"]
+    file_path = os.path.join(cog["filepath"], cog["filename"])
+
+    # Build the base url with either bbox or preview endpoint
+    if bbox:
+        bbox_str = f"{bbox['minx']},{bbox['miny']},{bbox['maxx']},{bbox['maxy']}"
+        
+        base_url = f"{TITILER_BASE}/bbox/{bbox_str}.png"
+    else:
+        base_url = f"{TITILER_BASE}/preview"
+    
+    # Build query parameters
+    params = [f"url={file_path}"]
+    
+    # Add band indices from COG metadata
+    band_params = []
+    for band in cog["bands"]:
+        band_params.append(f"bidx={band['bandId']}")
+    
+    params.extend(band_params)
+    
+    # Add optional colormap if provided
+    if color_map:
+        params.append(f"colormap_name={color_map}")
+    
+    # Add min/max values for rendering if available in the first band
+    # if cog["bands"] and "min" in cog["bands"][0] and "max" in cog["bands"][0]:
+    #     params.append(f"rescale={cog['bands'][0]['min']},{cog['bands'][0]['max']}")
+    
+    # Combine base url with query parameters
+    url = f"{base_url}?{'&'.join(params)}"
+    print(f"Generated TiTiler URL: {url}")
+    return url
+
+def download_image(url: str) -> Image.Image:
+    print(f"Downloading image from: {url}")
+    response = requests.get(url)
+    response.raise_for_status()
+    img = Image.open(BytesIO(response.content)).convert("RGBA")
+    print("✅ Image downloaded and converted")
+    return img
+
+def build_gif(images: List[Image.Image]) -> BytesIO:
+    gif_bytes = BytesIO()
+    if images:
+        print(f"Building GIF with {len(images)} frames")
+        images[0].save(
+            gif_bytes,
+            format="GIF",
+            save_all=True,
+            append_images=images[1:],
+            duration=500,
+            loop=0
+        )
+    else:
+        print("⚠️ No images to include in GIF")
+    gif_bytes.seek(0)
+    return gif_bytes
+
 
 def download_from_titiler(url, output_path):
     response = requests.get(url, stream=True)
@@ -247,6 +359,28 @@ def stack_layers():
     finally:
         if 'temp_dir' in locals():
             shutil.rmtree(temp_dir, ignore_errors=True)
+
+@app.route("/generate-gif", methods=["POST"])
+def generate_gif_endpoint():
+    input_data = request.get_json()
+    print("Received request with data:", input_data)
+    try:
+        selected_cogs = get_filtered_cogs(input_data)
+        images = []
+        for cog in selected_cogs:
+            try:
+                titiler_url = generate_titiler_url(cog, input_data)
+                img = download_image(titiler_url)
+                images.append(img)
+                print(f"✅ Added image from {cog['filename']} to GIF")
+            except Exception as img_err:
+                print(f"❌ Error downloading image for {cog['filename']}: {img_err}")
+        gif_buffer = build_gif(images)
+        return send_file(gif_buffer, mimetype="image/gif", download_name="output.gif")
+    except Exception as e:
+        print(f"❌ Error in generate_gif_endpoint: {e}")
+        return jsonify({"error": str(e)}), 500
+
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000)
