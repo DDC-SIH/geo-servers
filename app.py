@@ -361,6 +361,99 @@ def stack_layers():
             shutil.rmtree(temp_dir, ignore_errors=True)
 
 @app.route("/generate-gif", methods=["POST"])
+@swag_from({
+    'tags': ['GIF Generation'],
+    'summary': 'Generate animated GIF from selected COG raster layers',
+    'description': 'Generates a GIF by fetching raster images (COG) based on date range, satellite ID, band, and other filtering parameters.',
+    'parameters': [
+        {
+            'name': 'body',
+            'in': 'body',
+            'required': True,
+            'schema': {
+                'type': 'object',
+                'properties': {
+                    'SatelliteId': {
+                        'type': 'string',
+                        'example': '3R',
+                        'description': 'Satellite identifier (e.g., "3R")'
+                    },
+                    'startDateTime': {
+                        'type': 'string',
+                        'format': 'date-time',
+                        'example': '2025-03-22T00:00:00',
+                        'description': 'Start datetime for filtering COGs (ISO format)'
+                    },
+                    'endDateTime': {
+                        'type': 'string',
+                        'format': 'date-time',
+                        'example': '2025-03-22T00:05:45',
+                        'description': 'End datetime for filtering COGs (ISO format)'
+                    },
+                    'interval': {
+                        'type': 'integer',
+                        'example': 1,
+                        'description': 'Hour-based interval between selected COGs'
+                    },
+                    'processingLevel': {
+                        'type': 'string',
+                        'example': 'L1C',
+                        'description': 'Processing level of satellite data'
+                    },
+                    'productType': {
+                        'type': 'string',
+                        'example': 'ASIA_MER',
+                        'description': 'Product type code (e.g., "ASIA_MER")'
+                    },
+                    'bandName': {
+                        'type': 'string',
+                        'example': 'TIR2',
+                        'description': 'Spectral band name (e.g., "TIR2")'
+                    },
+                    'bbox': {
+                        'type': 'object',
+                        'properties': {
+                            'minx': {'type': 'number', 'example': 72.5},
+                            'miny': {'type': 'number', 'example': 15.5},
+                            'maxx': {'type': 'number', 'example': 88.5},
+                            'maxy': {'type': 'number', 'example': 27.5}
+                        },
+                        'required': ['minx', 'miny', 'maxx', 'maxy'],
+                        'description': 'Bounding box for clipping the raster (WGS84 coordinates)'
+                    },
+                    'colourmap': {
+                        'type': 'string',
+                        'example': 'viridis',
+                        'description': 'Color map name used to render the imagery'
+                    }
+                },
+                'required': [
+                    'SatelliteId', 'startDateTime', 'endDateTime', 'interval',
+                    'processingLevel', 'productType', 'bandName', 'colourmap'
+                ]
+            }
+        }
+    ],
+    'responses': {
+        200: {
+            'description': 'Animated GIF created from selected raster images',
+            'content': {
+                'image/gif': {
+                    'schema': {
+                        'type': 'string',
+                        'format': 'binary'
+                    }
+                }
+            }
+        },
+        400: {
+            'description': 'Invalid request format or missing required fields'
+        },
+        500: {
+            'description': 'Internal server error during GIF generation'
+        }
+    }
+})
 def generate_gif_endpoint():
     input_data = request.get_json()
     print("Received request with data:", input_data)
