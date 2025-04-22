@@ -78,8 +78,9 @@ def convert_epoch_to_datetime(epoch_ms: int) -> datetime.datetime:
     return datetime.datetime.fromtimestamp(epoch_ms / 1000)
 
 def get_filtered_cogs(input_data: dict) -> List[dict]:
-    start = datetime.datetime.fromisoformat(input_data["startDateTime"])
-    end = datetime.datetime.fromisoformat(input_data["endDateTime"])
+    from dateutil.parser import isoparse
+    start = isoparse(input_data["startDateTime"]).replace(tzinfo=None)
+    end = isoparse(input_data["endDateTime"]).replace(tzinfo=None)
     interval = int(input_data["interval"])
 
     url = METADATA_API.format(sat=input_data["SatelliteId"])
