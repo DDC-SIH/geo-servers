@@ -82,20 +82,25 @@ def get_filtered_cogs(input_data: dict) -> List[dict]:
     start = isoparse(input_data["startDateTime"]).replace(tzinfo=None)
     end = isoparse(input_data["endDateTime"]).replace(tzinfo=None)
     interval = int(input_data["interval"])
+    band_names = input_data["bandName"] if isinstance(input_data["bandName"], list) else [input_data["bandName"]]
 
     url = METADATA_API.format(sat=input_data["SatelliteId"])
     params = {
         "start": input_data["startDateTime"],
         "end": input_data["endDateTime"],
         "processingLevel": input_data["processingLevel"],
-        "productCode": input_data["productType"],
-        "type": input_data["bandName"]
+        "productCode": input_data["productType"]
     }
+    if len(band_names) == 1:
+        params["type"] = band_names[0]
+    
+    print(f"Fetching metadata from: {url} with params: {params}")
 
     print(f"Fetching metadata from: {url} with params: {params}")
     response = requests.get(url, params=params)
     response.raise_for_status()
     cogs = response.json().get("cogs", [])
+    print(response.json())
     print(f"Received {len(cogs)} COGs")
 
     sorted_cogs = sorted(cogs, key=lambda c: c["aquisition_datetime"])
@@ -105,6 +110,8 @@ def get_filtered_cogs(input_data: dict) -> List[dict]:
     for cog in sorted_cogs:
         cog_time = convert_epoch_to_datetime(cog["aquisition_datetime"])
         if cog_time >= current_time and cog_time <= end:
+            if len(band_names) > 1 and cog.get("type") != "MULTI":
+                continue
             selected.append(cog)
             current_time = cog_time + datetime.timedelta(hours=interval)
 
@@ -112,38 +119,38 @@ def get_filtered_cogs(input_data: dict) -> List[dict]:
     return selected
 
 def generate_titiler_url(cog: dict, input_data: dict) -> str:
-    # print(f"Generating TiTiler URL for COG: {cog}")
     bbox = input_data.get("bbox")
     print(f"Using bbox: {bbox}" if bbox else "No bbox provided, using preview")
-    color_map = input_data["colourmap"]
+    color_map = input_data.get("colourmap")  # Make colourmap optional
     file_path = os.path.join(cog["filepath"], cog["filename"])
 
     # Build the base url with either bbox or preview endpoint
     if bbox:
         bbox_str = f"{bbox['minx']},{bbox['miny']},{bbox['maxx']},{bbox['maxy']}"
-        
         base_url = f"{TITILER_BASE}/bbox/{bbox_str}.png"
     else:
         base_url = f"{TITILER_BASE}/preview"
-    
+
     # Build query parameters
     params = [f"url={file_path}"]
-    
+
     # Add band indices from COG metadata
     band_params = []
-    for band in cog["bands"]:
-        band_params.append(f"bidx={band['bandId']}")
-    
+    if len(input_data["bandName"]) > 1:
+        for band_name in input_data["bandName"]:
+            for band in cog["bands"]:
+                if band["description"] == band_name or band["description"] == f"IMG_{band_name}":
+                    band_params.append(f"bidx={band['bandId']}")
+    else:
+        for band in cog["bands"]:
+            band_params.append(f"bidx={band['bandId']}")
+
     params.extend(band_params)
-    
+
     # Add optional colormap if provided
     if color_map:
         params.append(f"colormap_name={color_map}")
-    
-    # Add min/max values for rendering if available in the first band
-    # if cog["bands"] and "min" in cog["bands"][0] and "max" in cog["bands"][0]:
-    #     params.append(f"rescale={cog['bands'][0]['min']},{cog['bands'][0]['max']}")
-    
+
     # Combine base url with query parameters
     url = f"{base_url}?{'&'.join(params)}"
     print(f"Generated TiTiler URL: {url}")
