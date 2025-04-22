@@ -26,7 +26,51 @@ from typing import List
 
 app = Flask(__name__)
 CORS(app)
-swagger = Swagger(app)
+
+# Configure Swagger
+swagger_config = {
+    "headers": [],
+    "specs": [
+        {
+            "endpoint": "apispec",
+            "route": "/apispec.json",
+            "rule_filter": lambda rule: True,
+            "model_filter": lambda tag: True,
+        }
+    ],
+    "static_url_path": "/flasgger_static",
+    "swagger_ui": True,
+    "specs_route": "/api/docs/"
+}
+
+swagger_template = {
+    "info": {
+        "title": "Geo Server API",
+        "description": "API for geospatial data operations, including raster processing and GIF generation",
+        "version": "1.0.0",
+        "contact": {
+            "email": "souradip1000@gmail.com"
+        }
+    },
+    "tags": [
+        {
+            "name": "Download",
+            "description": "Operations for downloading and processing raster data"
+        },
+        {
+            "name": "GIF Generation",
+            "description": "Operations for creating animated GIFs from raster time series"
+        }
+    ],
+    "servers": [
+        {
+            "url": "http://74.226.242.56:5000",
+            "description": "Production server"
+        }
+    ],
+}
+
+swagger = Swagger(app, config=swagger_config, template=swagger_template)
 TITILER_BASE = "http://74.226.242.56:8000/cog"
 METADATA_API = "http://74.226.242.56:7000/api/metadata/{sat}/cog/range"
 
