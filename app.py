@@ -22,6 +22,7 @@ import requests
 import datetime
 from PIL import Image
 from typing import List
+from urllib.parse import quote_plus
 
 
 app = Flask(__name__)
@@ -525,7 +526,137 @@ def generate_gif_endpoint():
     except Exception as e:
         print(f"❌ Error in generate_gif_endpoint: {e}")
         return jsonify({"error": str(e)}), 500
+@app.route("/pointprobe", methods=["POST"])
+@swag_from({
+    "tags": ["Probe"],
+    "summary": "Sample pixel values at a lon/lat across a time‐series",
+    "description": (
+        "Fetches COG metadata using the same filter rules as `/generate-gif`, "
+        "then for each COG calls TiTiler’s `/point/{lon},{lat}` endpoint to "
+        "sample pixel values for the requested band(s)."
+    ),
+    "consumes": ["application/json"],
+    "produces": ["application/json"],
+    "parameters": [
+        {
+            "name": "body",
+            "in": "body",
+            "required": True,
+            "schema": {
+                "type": "object",
+                "required": [
+                    "SatelliteId","startDateTime","endDateTime","interval",
+                    "processingLevel","productType","bandName","coordinate"
+                ],
+                "properties": {
+                    "SatelliteId":     {"type": "string", "example": "3R"},
+                    "startDateTime":   {"type": "string","format":"date-time",
+                                        "example":"2025-03-22T00:00:00"},
+                    "endDateTime":     {"type": "string","format":"date-time",
+                                        "example":"2025-03-22T06:00:00"},
+                    "interval":        {"type": "integer", "example": 1},
+                    "processingLevel": {"type": "string",  "example": "L1C"},
+                    "productType":     {"type": "string",  "example": "ASIA_MER"},
+                    "bandName":        {
+                        "oneOf": [
+                            {"type":"string","example":"TIR2"},
+                            {"type":"array","items":{"type":"string"},"example":["TIR2","VIS0"]}
+                        ]
+                    },
+                    "coordinate": {
+                        "type": "object",
+                        "required": ["lat","lon"],
+                        "properties": {
+                            "lat": {"type": "number","example": 22.5726},
+                            "lon": {"type": "number","example": 88.3639}
+                        },
+                        "description": "Point coordinate for sampling"
+                    }
+                }
+            }
+        }
+    ],
+    "responses": {
+        "200": {
+            "description": "List of per-file samples",
+            "schema": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "file":   {"type": "string"},
+                        "date":   {"type": "string", "format":"date-time"},
+                        "values": {
+                            "type": "object",
+                            "additionalProperties": {"type":"number"}
+                        }
+                    }
+                }
+            }
+        },
+        "400": {
+            "description": "Bad request",
+            "schema": {"type":"object","properties":{"error":{"type":"string"}}}
+        },
+        "500": {
+            "description": "Server error",
+            "schema": {"type":"object","properties":{"error":{"type":"string"}}}
+        }
+    }
+})
+def pointprobe():
+    data = request.get_json(force=True)
+    lat = data.get("coordinate", {}).get("lat")
+    lon = data.get("coordinate", {}).get("lon")
+    if lat is None or lon is None:
+        return jsonify({"error": "Missing coordinate.lat or coordinate.lon"}), 400
 
+    try:
+        cogs = get_filtered_cogs(data)
+        out = []
+
+        # Normalize bandName to a list
+        bands = (
+            data["bandName"] if isinstance(data["bandName"], list)
+            else [data["bandName"]]
+        )
+
+        for cog in cogs:
+            # 1️⃣ build and encode a file:// URL
+            file_url = f"file://{cog['filepath']}/{cog['filename']}"
+            encoded = quote_plus(file_url)
+
+            # 2️⃣ use the /point/{lon},{lat} path (no .json)
+            url = f"{TITILER_BASE}/point/{lon},{lat}?url={encoded}"
+
+            # 3️⃣ tell TiTiler exactly which band(s) to sample
+            for b in bands:
+                # find the matching bandId from metadata
+                for band in cog["bands"]:
+                    if band["description"] in (b, f"IMG_{b}"):
+                        url += f"&bidx={band['bandId']}"
+
+            # 4️⃣ fetch and parse
+            resp = requests.get(url)
+            resp.raise_for_status()
+            js = resp.json()
+
+            # 5️⃣ TiTiler returns "band_names" + "values"
+            names  = js.get("band_names", [])
+            values = js.get("values",      [])
+
+            vals = { name: val for name, val in zip(names, values) }
+
+            out.append({
+                "file":   cog["filename"],
+                "date":   convert_epoch_to_datetime(cog["aquisition_datetime"]).isoformat(),
+                "values": vals
+            })
+
+        return jsonify(out)
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000)
