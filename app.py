@@ -23,7 +23,11 @@ import datetime
 from PIL import Image
 from typing import List
 from urllib.parse import quote_plus
-
+import torch
+from torch import nn
+import torch.nn.functional as F
+from pyproj import Transformer
+from rasterio.crs import CRS
 
 app = Flask(__name__)
 CORS(app)
@@ -667,6 +671,409 @@ def pointprobe():
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+import torch
+from torch import nn
+import torch.nn.functional as F
+
+# First, add the model class definition
+class UNET(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+
+        self.conv1 = self.contract_block(in_channels, 32, 7, 3)
+        self.conv2 = self.contract_block(32, 64, 3, 1)
+        self.conv3 = self.contract_block(64, 128, 3, 1)
+
+        self.upconv3 = self.expand_block(128, 64, 3, 1)
+        self.upconv2 = self.expand_block(64*2, 32, 3, 1)
+        self.upconv1 = self.expand_block(32*2, out_channels, 3, 1)
+
+    def forward(self, x):
+        # downsampling part
+        conv1 = self.conv1(x)
+        conv2 = self.conv2(conv1)
+        conv3 = self.conv3(conv2)
+
+        upconv3 = self.upconv3(conv3)
+        
+        # Add center cropping to handle size mismatch
+        # Make sure upconv3 and conv2 have the same spatial dimensions
+        if upconv3.size() != conv2.size():
+            # Calculate center crop dimensions
+            target_size = upconv3.size()[-2:]  # Get height, width of upconv3
+            current_size = conv2.size()[-2:]   # Get height, width of conv2
+            
+            # Calculate how much to crop from each side
+            diff_h = (current_size[0] - target_size[0]) // 2
+            diff_w = (current_size[1] - target_size[1]) // 2
+            
+            # Crop conv2 to match upconv3
+            if diff_h > 0 or diff_w > 0:
+                conv2 = conv2[:, :, 
+                              diff_h:diff_h + target_size[0], 
+                              diff_w:diff_w + target_size[1]]
+            
+            # If upconv3 is bigger, we need to crop it instead
+            elif diff_h < 0 or diff_w < 0:
+                diff_h, diff_w = abs(diff_h), abs(diff_w)
+                upconv3 = upconv3[:, :, 
+                                 diff_h:diff_h + current_size[0], 
+                                 diff_w:diff_w + current_size[1]]
+        
+        upconv2 = self.upconv2(torch.cat([upconv3, conv2], 1))
+        
+        # Same cropping for upconv2 and conv1
+        if upconv2.size() != conv1.size():
+            target_size = upconv2.size()[-2:]
+            current_size = conv1.size()[-2:]
+            
+            diff_h = (current_size[0] - target_size[0]) // 2
+            diff_w = (current_size[1] - target_size[1]) // 2
+            
+            if diff_h > 0 or diff_w > 0:
+                conv1 = conv1[:, :, 
+                              diff_h:diff_h + target_size[0], 
+                              diff_w:diff_w + target_size[1]]
+            elif diff_h < 0 or diff_w < 0:
+                diff_h, diff_w = abs(diff_h), abs(diff_w)
+                upconv2 = upconv2[:, :, 
+                                 diff_h:diff_h + current_size[0], 
+                                 diff_w:diff_w + current_size[1]]
+        
+        upconv1 = self.upconv1(torch.cat([upconv2, conv1], 1))
+
+        return upconv1
+
+    # Rest of the methods remain the same
+    def contract_block(self, in_channels, out_channels, kernel_size, padding):
+        contract = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, stride=1, padding=padding),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(),
+            nn.Conv2d(out_channels, out_channels, kernel_size=kernel_size, stride=1, padding=padding),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        )
+        return contract
+
+    def expand_block(self, in_channels, out_channels, kernel_size, padding):
+        expand = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size, stride=1, padding=padding),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(),
+            nn.Conv2d(out_channels, out_channels, kernel_size, stride=1, padding=padding),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(),
+            nn.ConvTranspose2d(out_channels, out_channels, kernel_size=3, stride=2, padding=1, output_padding=1) 
+        )
+        return expand
+
+# Initialize the model at application startup
+cloud_model = None
+
+@app.before_first_request
+def load_cloud_model():
+    global cloud_model
+    # Initialize model
+    cloud_model = UNET(in_channels=4, out_channels=2)
+    
+    # Load the model weights - update the path to your model file
+    model_path = "/home/sbn/souradip/geo-servers/unet_cloud_segmentation.pth"
+    try:
+        cloud_model.load_state_dict(torch.load(model_path))
+        cloud_model.eval()
+        print(f"✅ Cloud segmentation model loaded from {model_path}")
+    except Exception as e:
+        print(f"❌ Error loading cloud model: {str(e)}")
+
+# Helper function to preprocess imagery for the model
+def preprocess_for_cloud_model(raster_data):
+    """
+    Preprocess satellite imagery for the cloud segmentation model.
+    
+    Args:
+        raster_data: Dictionary containing the satellite bands
+    
+    Returns:
+        torch.Tensor: Tensor ready for model input
+    """
+    # Extract and normalize the required bands (R, G, B, NIR)
+    bands = []
+    
+    # Use the first 4 bands if we have them (assuming RGB + NIR)
+    for i in range(min(4, len(raster_data))):
+        band = raster_data[i].astype(np.float32)
+        
+        # Check if band is empty before normalizing
+        if band.size > 0:
+            # Normalize band values to 0-1 range
+            band_min = band.min()
+            band_max = band.max()
+            
+            if band_max > band_min:
+                band = (band - band_min) / (band_max - band_min)
+        else:
+            # Handle empty band by creating a zero array with expected dimensions
+            print(f"Warning: Empty band encountered at index {i}")
+            # If we have other bands, use their shape to create zeros
+            if bands:
+                band = np.zeros_like(bands[0])
+            else:
+                # If this is the first band and it's empty, we need to handle this case
+                # For example, use a small default size or return an error
+                raise ValueError(f"Band at index {i} is empty and no previous bands exist to determine shape")
+        
+        bands.append(band)
+    
+    # Pad with zeros if we have fewer than 4 bands
+    while len(bands) < 4:
+        if bands:
+            bands.append(np.zeros_like(bands[0]))
+        else:
+            # If we have no bands at all, we can't proceed
+            raise ValueError("No valid bands found in the input data")
+    
+    # Stack bands into tensor with shape [4, H, W]
+    tensor = torch.tensor(np.stack(bands), dtype=torch.float32)
+    
+    return tensor.unsqueeze(0)  # Add batch dimension [1, 4, H, W]
+@app.route("/cloud-mask", methods=["POST"])
+@swag_from({
+    'tags': ['Cloud Detection'],
+    'summary': 'Generate cloud segmentation mask for satellite imagery',
+    'description': 'Creates a cloud segmentation mask using a U-Net deep learning model',
+    'parameters': [
+        {
+            'name': 'body',
+            'in': 'body',
+            'required': True,
+            'schema': {
+                'type': 'object',
+                'properties': {
+                    'SatelliteId': {'type': 'string', 'example': '3R'},
+                    'startDateTime': {'type': 'string', 'format': 'date-time', 
+                                     'example': '2025-03-22T00:00:00'},
+                    'endDateTime': {'type': 'string', 'format': 'date-time',
+                                   'example': '2025-03-22T00:05:45'},
+                    'processingLevel': {'type': 'string', 'example': 'L1C'},
+                    'productType': {'type': 'string', 'example': 'ASIA_MER'},
+                    'bbox': {
+                        'type': 'object',
+                        'properties': {
+                            'minx': {'type': 'number', 'example': 72.5},
+                            'miny': {'type': 'number', 'example': 15.5},
+                            'maxx': {'type': 'number', 'example': 88.5},
+                            'maxy': {'type': 'number', 'example': 27.5}
+                        }
+                    },
+                    'format': {'type': 'string', 'enum': ['png', 'tiff', 'json'], 'default': 'png'},
+                    'confidenceThreshold': {'type': 'number', 'minimum': 0, 'maximum': 1, 'default': 0.5,
+                                          'description': 'Threshold for cloud confidence (0-1)'}
+                },
+                'required': ['SatelliteId', 'startDateTime', 'endDateTime', 
+                            'processingLevel', 'productType']
+            }
+        }
+    ],
+    'responses': {
+        '200': {
+            'description': 'Cloud segmentation mask as requested format'
+        },
+        '400': {
+            'description': 'Bad request parameters'
+        },
+        '500': {
+            'description': 'Server error during processing'
+        }
+    }
+})
+def generate_cloud_mask():
+    """Generate cloud mask using the loaded U-Net model."""
+    data = request.get_json(force=True)
+    output_format = data.get('format', 'png').lower()
+    confidence_threshold = float(data.get('confidenceThreshold', 0.5))
+    
+    # Add default bandName if not provided
+    if 'bandName' not in data:
+        data['bandName'] = ['VIS', 'SWIR', 'TIR1', 'TIR2']  # Default bands for cloud detection
+    
+    
+    # Create temporary directory for outputs
+    temp_dir = tempfile.mkdtemp()
+    output_path = os.path.join(temp_dir, f"cloud_mask.{output_format}")
+    
+    try:
+        # Validate if model is loaded
+        if cloud_model is None:
+            return jsonify({"error": "Cloud segmentation model not loaded"}), 500
+            
+        # Get selected COG using the existing filtering function
+        selected_cogs = get_filtered_cogs(data)
+        
+        if not selected_cogs:
+            return jsonify({"error": "No COGs found matching criteria"}), 404
+            
+        # Use the most recent COG
+        cog = selected_cogs[-1]
+        cog_path = os.path.join(cog['filepath'], cog['filename'])
+        
+        # Process the imagery - handle both bounding box clipping and full frame
+        with rasterio.open(cog_path) as src:
+            # Get metadata for later use
+            transform = src.transform
+            crs = src.crs
+            
+            # Read the bands (assuming we need the first 4 bands for the model)
+            # This needs to be adjusted based on your model's requirements
+            bands_data = []
+            band_ids = []
+            
+            # Look for VIS, RED, GREEN, BLUE, NIR in band descriptions
+            target_bands = ['VIS', 'RED', 'GREEN', 'BLUE', 'NIR', 'SWIR']
+            found_bands = set()
+            
+            # First try to find the explicit bands
+            for band in cog["bands"]:
+                band_desc = band["description"]
+                # Check if band matches any target
+                for target in target_bands:
+                    if target in band_desc and target not in found_bands:
+                        band_ids.append(band['bandId'])
+                        found_bands.add(target)
+                        break
+            
+            # If we didn't find 4 bands, just take the first 4 available
+            if len(band_ids) < 4:
+                band_ids = [b['bandId'] for b in cog["bands"][:4]]
+            
+            # Only use the first 4 bands (R, G, B, NIR pattern expected by model)
+            band_ids = band_ids[:4]
+            
+            # Read the data with bounds if provided
+            # Read the data with bounds if provided
+            if 'bbox' in data:
+                bbox = data['bbox']
+                geo_bounds = (bbox['minx'], bbox['miny'], bbox['maxx'], bbox['maxy'])
+                print(f"Requested geo bounds: {geo_bounds}")
+                
+                # If the bbox is in geographic coordinates but the image is in projected coordinates
+                if (crs.is_projected and 
+                    bbox['minx'] >= -180 and bbox['maxx'] <= 180 and 
+                    bbox['miny'] >= -90 and bbox['maxy'] <= 90):
+                    
+                    # Create a transformer from geographic (EPSG:4326) to the image's CRS
+                    transformer = Transformer.from_crs(CRS.from_epsg(4326), crs, always_xy=True)
+                    
+                    # Transform the bounding box
+                    minx, miny = transformer.transform(geo_bounds[0], geo_bounds[1])
+                    maxx, maxy = transformer.transform(geo_bounds[2], geo_bounds[3])
+                    proj_bounds = (minx, miny, maxx, maxy)
+                    
+                    print(f"Transformed to projected bounds: {proj_bounds}")
+                    window = rasterio.windows.from_bounds(*proj_bounds, transform=transform)
+                else:
+                    # Use bounds as-is if they're already in the correct CRS
+                    window = rasterio.windows.from_bounds(*geo_bounds, transform=transform)
+                
+                print(f"Window: {window}")
+                
+                # Validate the window size
+                win_width = window.width
+                win_height = window.height
+                
+                if win_width < 1 or win_height < 1:
+                    return jsonify({
+                        "error": "Requested bounding box is too small or outside image extent",
+                        "details": {
+                            "window_width": win_width,
+                            "window_height": win_height
+                        }
+                    }), 400
+                
+                # Read data with window
+                raster_data = []
+                for idx in band_ids:
+                    band_data = src.read(idx, window=window)
+                    print(f"Band {idx} shape: {band_data.shape}, size: {band_data.size}")
+                    if band_data.size == 0:
+                        return jsonify({"error": f"Empty data read for band {idx}"}), 400
+                    raster_data.append(band_data)
+            else:
+                # Read full image
+                raster_data = []
+                for idx in band_ids:
+                    band_data = src.read(idx)
+                    print(f"Band {idx} shape: {band_data.shape}, size: {band_data.size}")
+                    raster_data.append(band_data)
+            # Preprocess the raster data for model input
+            input_tensor = preprocess_for_cloud_model(raster_data)
+            
+            # Run inference with the model
+            with torch.no_grad():
+                output = cloud_model(input_tensor)
+                
+                # Apply softmax to get probabilities
+                probabilities = F.softmax(output, dim=1)
+                
+                # Get cloud probability (class 1)
+                cloud_prob = probabilities[0, 1].cpu().numpy()
+                
+                # Apply threshold to get binary mask
+                cloud_mask = (cloud_prob >= confidence_threshold).astype(np.uint8) * 255
+            
+            # Save result based on format
+            if output_format == 'tiff':
+                with rasterio.open(
+                    output_path,
+                    'w',
+                    driver='GTiff',
+                    height=cloud_mask.shape[0],
+                    width=cloud_mask.shape[1],
+                    count=1,
+                    dtype=rasterio.uint8,
+                    crs=crs,
+                    transform=transform
+                ) as dst:
+                    dst.write(cloud_mask, 1)
+                    
+                return send_file(output_path, mimetype="image/tiff", 
+                                download_name="cloud_mask.tiff")
+                
+            elif output_format == 'png':
+                # Create PNG visualization
+                cloud_mask_img = Image.fromarray(cloud_mask)
+                cloud_mask_img.save(output_path)
+                
+                return send_file(output_path, mimetype="image/png", 
+                                download_name="cloud_mask.png")
+                
+            elif output_format == 'json':
+                # Return statistics about cloud coverage
+                total_pixels = cloud_mask.size
+                cloud_pixels = np.sum(cloud_mask > 0)
+                cloud_percentage = (cloud_pixels / total_pixels) * 100
+                
+                # Calculate connected components for cloud count
+                from skimage import measure
+                labels, num_clouds = measure.label(cloud_mask, return_num=True)
+                
+                return jsonify({
+                    "cloudPercentage": round(cloud_percentage, 2),
+                    "cloudCount": num_clouds,
+                    "timestamp": convert_epoch_to_datetime(cog["aquisition_datetime"]).isoformat(),
+                    "filename": cog["filename"]
+                })
+                
+    except Exception as e:
+        import traceback
+        print(traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
+        
+    finally:
+        if 'temp_dir' in locals():
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000)
