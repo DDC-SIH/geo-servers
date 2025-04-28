@@ -613,46 +613,56 @@ def pointprobe():
 
     try:
         cogs = get_filtered_cogs(data)
-        out = []
-
+        
         # Normalize bandName to a list
         bands = (
             data["bandName"] if isinstance(data["bandName"], list)
             else [data["bandName"]]
         )
+        
+        def process_cog(cog):
+            try:
+                # 1️⃣ build and encode a file:// URL
+                file_url = f"file://{cog['filepath']}/{cog['filename']}"
+                encoded = quote_plus(file_url)
 
-        for cog in cogs:
-            # 1️⃣ build and encode a file:// URL
-            file_url = f"file://{cog['filepath']}/{cog['filename']}"
-            encoded = quote_plus(file_url)
+                # 2️⃣ use the /point/{lon},{lat} path (no .json)
+                url = f"{TITILER_BASE}/point/{lon},{lat}?url={encoded}"
 
-            # 2️⃣ use the /point/{lon},{lat} path (no .json)
-            url = f"{TITILER_BASE}/point/{lon},{lat}?url={encoded}"
+                # 3️⃣ tell TiTiler exactly which band(s) to sample
+                for b in bands:
+                    # find the matching bandId from metadata
+                    for band in cog["bands"]:
+                        if band["description"] in (b, f"IMG_{b}"):
+                            url += f"&bidx={band['bandId']}"
 
-            # 3️⃣ tell TiTiler exactly which band(s) to sample
-            for b in bands:
-                # find the matching bandId from metadata
-                for band in cog["bands"]:
-                    if band["description"] in (b, f"IMG_{b}"):
-                        url += f"&bidx={band['bandId']}"
+                # 4️⃣ fetch and parse
+                resp = requests.get(url)
+                resp.raise_for_status()
+                js = resp.json()
 
-            # 4️⃣ fetch and parse
-            resp = requests.get(url)
-            resp.raise_for_status()
-            js = resp.json()
+                # 5️⃣ TiTiler returns "band_names" + "values"
+                names = js.get("band_names", [])
+                values = js.get("values", [])
 
-            # 5️⃣ TiTiler returns "band_names" + "values"
-            names  = js.get("band_names", [])
-            values = js.get("values",      [])
+                vals = {name: val for name, val in zip(names, values)}
 
-            vals = { name: val for name, val in zip(names, values) }
+                return {
+                    "file": cog["filename"],
+                    "date": convert_epoch_to_datetime(cog["aquisition_datetime"]).isoformat(),
+                    "values": vals
+                }
+            except Exception as e:
+                print(f"Error processing COG {cog['filename']}: {str(e)}")
+                return None
 
-            out.append({
-                "file":   cog["filename"],
-                "date":   convert_epoch_to_datetime(cog["aquisition_datetime"]).isoformat(),
-                "values": vals
-            })
-
+        # Use ThreadPoolExecutor to process COGs in parallel
+        with ThreadPoolExecutor(max_workers=min(10, len(cogs))) as executor:
+            results = list(executor.map(process_cog, cogs))
+        
+        # Filter out any None results (failed processing)
+        out = [result for result in results if result is not None]
+        
         return jsonify(out)
 
     except Exception as e:
