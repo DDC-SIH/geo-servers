@@ -616,8 +616,6 @@ def generate_gif_endpoint():
         # Get statistical information for the first COG to create appropriate legend ranges
         cog_stats = None
         legend_img = None
-        value_ranges = []
-        colors = []
         
         try:
             # Get stats for the first COG to determine value ranges for the legend
@@ -628,6 +626,7 @@ def generate_gif_endpoint():
                 
                 # Get stats from TiTiler
                 stats_url = f"{TITILER_BASE}/statistics?url={quote_plus(first_cog_url)}"
+                print(f"Fetching statistics from: {stats_url}")
                 stats_response = requests.get(stats_url)
                 
                 if stats_response.status_code == 200:
@@ -638,10 +637,13 @@ def generate_gif_endpoint():
                     band_key = list(cog_stats.keys())[0]  # Usually 'b1'
                     band_stats = cog_stats[band_key]
                     
+                    # Get min/max values directly from statistics
                     min_val = band_stats.get('min', 0)
                     max_val = band_stats.get('max', 255)
+                    print(f"Min value: {min_val}, Max value: {max_val}")
                     
                     # Create value ranges for legend
+                    value_ranges = []
                     if 'histogram' in band_stats and len(band_stats['histogram']) > 1:
                         bins = band_stats['histogram'][1]
                         value_ranges = [[bins[i], bins[i+1]] for i in range(len(bins)-1)]
@@ -710,6 +712,7 @@ def generate_gif_endpoint():
                             return f"{val:.2f}"
                         return str(val)
                     
+                    # Use the actual min/max values from statistics
                     min_text = format_value(min_val)
                     max_text = format_value(max_val)
                     
@@ -721,7 +724,7 @@ def generate_gif_endpoint():
                     draw.text((legend_width - max_text_width, legend_height - 15), 
                              max_text, fill=(0, 0, 0, 255), font=small_font)
                     
-                    print("✅ Created custom interval-based legend image")
+                    print("✅ Created custom interval-based legend image with min/max values")
                 else:
                     print(f"⚠️ Could not get statistics, status code: {stats_response.status_code}")
                     # Fall back to default legend creation
@@ -751,10 +754,51 @@ def generate_gif_endpoint():
                 if legend_response.status_code == 200:
                     legend_img = Image.open(BytesIO(legend_response.content)).convert("RGBA")
                     print("✅ Generated legend image from TiTiler")
+                    
+                    # Since we're using TiTiler's legend, we should add min/max labels
+                    # But we need to ensure we have min/max values available
+                    if cog_stats is not None:
+                        # Add min and max values text from the statistics
+                        legend_height = legend_img.height + 20  # Add space for text
+                        extended_legend = Image.new('RGBA', (legend_img.width, legend_height), (255, 255, 255, 255))
+                        extended_legend.paste(legend_img, (0, 0))
+                        
+                        draw = ImageDraw.Draw(extended_legend)
+                        
+                        try:
+                            small_font = ImageFont.truetype("DejaVuSans.ttf", 10)
+                        except IOError:
+                            small_font = ImageFont.load_default()
+                        
+                        band_key = list(cog_stats.keys())[0]
+                        band_stats = cog_stats[band_key]
+                        min_val = band_stats.get('min', 0)
+                        max_val = band_stats.get('max', 255)
+                        
+                        # Format values
+                        def format_value(val):
+                            if isinstance(val, (int, float)):
+                                if val == int(val):
+                                    return str(int(val))
+                                return f"{val:.2f}"
+                            return str(val)
+                        
+                        min_text = format_value(min_val)
+                        max_text = format_value(max_val)
+                        
+                        # Draw min/max labels
+                        draw.text((0, legend_height - 15), min_text, fill=(0, 0, 0, 255), font=small_font)
+                        
+                        # Position max value on the right
+                        max_text_width = draw.textlength(max_text, small_font)
+                        draw.text((legend_img.width - max_text_width, legend_height - 15), 
+                                 max_text, fill=(0, 0, 0, 255), font=small_font)
+                        
+                        legend_img = extended_legend
                 else:
                     print(f"⚠️ Could not get legend, status code: {legend_response.status_code}")
-                    # Create a fallback legend
-                    legend_img = Image.new('RGBA', (200, 20), (255, 255, 255, 255))
+                    # Create a fallback legend with min/max
+                    legend_img = Image.new('RGBA', (200, 40), (255, 255, 255, 255))
                     draw = ImageDraw.Draw(legend_img)
                     
                     # Draw a gradient based on the colormap name
@@ -772,16 +816,78 @@ def generate_gif_endpoint():
                             draw.line([(x, 0), (x, 20)], fill=(int((x/200) * 255), 
                                                               int((1-(x/200)) * 255), 
                                                               int(127 * abs(math.sin(x/32))), 255))
-                    print("✅ Created fallback legend image")
+                            
+                    # Add min/max labels if stats are available
+                    if cog_stats is not None:
+                        try:
+                            small_font = ImageFont.truetype("DejaVuSans.ttf", 10)
+                        except IOError:
+                            small_font = ImageFont.load_default()
+                        
+                        band_key = list(cog_stats.keys())[0]
+                        band_stats = cog_stats[band_key]
+                        min_val = band_stats.get('min', 0)
+                        max_val = band_stats.get('max', 255)
+                        
+                        def format_value(val):
+                            if isinstance(val, (int, float)):
+                                if val == int(val):
+                                    return str(int(val))
+                                return f"{val:.2f}"
+                            return str(val)
+                        
+                        min_text = format_value(min_val)
+                        max_text = format_value(max_val)
+                        
+                        # Draw min/max labels
+                        draw.text((0, 25), min_text, fill=(0, 0, 0, 255), font=small_font)
+                        
+                        # Position max value on the right
+                        max_text_width = draw.textlength(max_text, small_font)
+                        draw.text((200 - max_text_width, 25), 
+                                 max_text, fill=(0, 0, 0, 255), font=small_font)
+                    
+                    print("✅ Created fallback legend image with min/max values")
             except Exception as legend_err:
                 print(f"⚠️ Error getting legend: {legend_err}")
                 # Create a simple grayscale legend as fallback
-                legend_img = Image.new('RGBA', (200, 20), (255, 255, 255, 255))
+                legend_img = Image.new('RGBA', (200, 40), (255, 255, 255, 255))
                 draw = ImageDraw.Draw(legend_img)
                 for x in range(200):
                     color = int(x * 255 / 200)
                     draw.line([(x, 0), (x, 20)], fill=(color, color, color, 255))
-                print("✅ Created simple grayscale legend as fallback")
+                
+                # Add min/max labels if stats are available
+                if cog_stats is not None:
+                    try:
+                        small_font = ImageFont.truetype("DejaVuSans.ttf", 10)
+                    except IOError:
+                        small_font = ImageFont.load_default()
+                    
+                    band_key = list(cog_stats.keys())[0]
+                    band_stats = cog_stats[band_key]
+                    min_val = band_stats.get('min', 0)
+                    max_val = band_stats.get('max', 255)
+                    
+                    def format_value(val):
+                        if isinstance(val, (int, float)):
+                            if val == int(val):
+                                return str(int(val))
+                            return f"{val:.2f}"
+                        return str(val)
+                    
+                    min_text = format_value(min_val)
+                    max_text = format_value(max_val)
+                    
+                    # Draw min/max labels
+                    draw.text((0, 25), min_text, fill=(0, 0, 0, 255), font=small_font)
+                    
+                    # Position max value on the right
+                    max_text_width = draw.textlength(max_text, small_font)
+                    draw.text((200 - max_text_width, 25), 
+                             max_text, fill=(0, 0, 0, 255), font=small_font)
+                
+                print("✅ Created simple grayscale legend as fallback with min/max values")
         
         # Process each COG
         for cog in selected_cogs:
@@ -885,7 +991,7 @@ def generate_gif_endpoint():
     except Exception as e:
         print(f"❌ Error in generate_gif_endpoint: {e}")
         return jsonify({"error": str(e)}), 500
-    
+
 @app.route("/pointprobe", methods=["POST"])
 @swag_from({
     "tags": ["Probe"],
