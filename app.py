@@ -13,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 import zipfile
 import matplotlib.pyplot as plt
 from flasgger import Swagger, swag_from
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 from flask_cors import CORS
 from flask import Flask, request, jsonify, send_file
 from io import BytesIO
@@ -516,20 +516,253 @@ def generate_gif_endpoint():
     print("Received request with data:", input_data)
     try:
         selected_cogs = get_filtered_cogs(input_data)
-        images = []
+        
+        # Handle case when no COGs are found
+        if not selected_cogs:
+            print("No COGs found for the specified criteria")
+            # Create a blank image with information about the query
+            info_img = Image.new('RGBA', (800, 400), (255, 255, 255, 255))
+            draw = ImageDraw.Draw(info_img)
+            
+            try:
+                font = ImageFont.truetype("DejaVuSans.ttf", 18)
+                small_font = ImageFont.truetype("DejaVuSans.ttf", 14)
+            except IOError:
+                font = ImageFont.load_default()
+                small_font = ImageFont.load_default()
+            
+            # Draw text with information about the request
+            draw.text((50, 50), "No Data Available", fill=(0, 0, 0, 255), font=font)
+            draw.text((50, 100), f"Satellite ID: {input_data.get('SatelliteId', 'N/A')}", fill=(0, 0, 0, 255), font=small_font)
+            draw.text((50, 130), f"Processing Level: {input_data.get('processingLevel', 'N/A')}", fill=(0, 0, 0, 255), font=small_font)
+            draw.text((50, 160), f"Product Type: {input_data.get('productType', 'N/A')}", fill=(0, 0, 0, 255), font=small_font)
+            draw.text((50, 190), f"Band: {input_data.get('bandName', 'N/A')}", fill=(0, 0, 0, 255), font=small_font)
+            draw.text((50, 220), f"Time Range: {input_data.get('startDateTime', 'N/A')} to {input_data.get('endDateTime', 'N/A')}", 
+                     fill=(0, 0, 0, 255), font=small_font)
+            draw.text((50, 280), "No data found for the specified time period and parameters.", 
+                     fill=(255, 0, 0, 255), font=small_font)
+            draw.text((50, 310), "Please adjust your search criteria and try again.", 
+                     fill=(255, 0, 0, 255), font=small_font)
+            
+            # Create GIF from the single info image
+            gif_buffer = BytesIO()
+            info_img.save(gif_buffer, format="GIF")
+            gif_buffer.seek(0)
+            
+            return send_file(gif_buffer, mimetype="image/gif", download_name="no_data.gif")
+        
+        enhanced_images = []
+        
+        # Check if ISRO logo file exists, otherwise download it
+        logo_path = "/home/sbn/souradip/geo-servers/Indian_Space_Research_Organisation_Logo.svg.png"
+        if not os.path.exists(logo_path):
+            # Try a different URL with User-Agent header to avoid 403 error
+            logo_urls = [
+                "https://www.isro.gov.in/media_isro/image/index/isro-logo.png",
+                "https://www.isro.gov.in/sites/default/files/2022-07/isro_logo_0.jpg",
+                "https://upload.wikimedia.org/wikipedia/commons/b/bd/Indian_Space_Research_Organisation_Logo.svg"
+            ]
+            
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            }
+            
+            for logo_url in logo_urls:
+                try:
+                    logo_response = requests.get(logo_url, headers=headers)
+                    if logo_response.status_code == 200:
+                        with open(logo_path, 'wb') as f:
+                            f.write(logo_response.content)
+                        print(f"✅ Downloaded ISRO logo to {logo_path}")
+                        break
+                    else:
+                        print(f"⚠️ Could not download ISRO logo from {logo_url}, status code: {logo_response.status_code}")
+                except Exception as logo_err:
+                    print(f"⚠️ Error downloading ISRO logo from {logo_url}: {logo_err}")
+            
+            # If all download attempts fail, create a basic placeholder logo
+            if not os.path.exists(logo_path):
+                print("Creating placeholder ISRO logo")
+                placeholder_logo = Image.new('RGBA', (200, 200), (255, 255, 255, 0))
+                draw = ImageDraw.Draw(placeholder_logo)
+                
+                try:
+                    font = ImageFont.truetype("DejaVuSans-Bold.ttf", 24)
+                except IOError:
+                    font = ImageFont.load_default()
+                
+                draw.text((40, 80), "ISRO", fill=(0, 0, 255, 255), font=font)
+                draw.text((25, 110), "Indian Space", fill=(0, 0, 0, 255), font=font)
+                draw.text((25, 140), "Research Org.", fill=(0, 0, 0, 255), font=font)
+                
+                # Draw a blue circle around the text
+                draw.ellipse((10, 10, 190, 190), outline=(0, 0, 255, 255), width=3)
+                
+                placeholder_logo.save(logo_path)
+                print("✅ Created placeholder ISRO logo")
+        
+        # Load the ISRO logo as a PIL Image
+        logo_img = None
+        if os.path.exists(logo_path):
+            try:
+                logo_img = Image.open(logo_path).convert("RGBA")
+                # Resize logo to appropriate size (e.g., 10% of image width)
+                logo_img = logo_img.resize((100, 100), Image.Resampling.LANCZOS)
+                print("✅ Loaded ISRO logo")
+            except Exception as e:
+                print(f"⚠️ Error loading ISRO logo: {e}")
+                logo_img = None
+        
+        # Get legend image from TiTiler if colormap is specified
+        legend_img = None
+        if input_data.get('colourmap'):
+            try:
+                # Add known valid colormaps supported by TiTiler
+                valid_colormaps = [
+                    'viridis', 'plasma', 'inferno', 'magma', 'cividis', 
+                    'terrain', 'rainbow', 'jet', 'turbo', 'hot', 'cool'
+                ]
+                
+                colormap = input_data['colourmap']
+                if colormap not in valid_colormaps:
+                    colormap = 'viridis'  # Default to viridis if the requested colormap is not supported
+                
+                legend_url = f"{TITILER_BASE}/legend"
+                legend_response = requests.get(legend_url)
+                
+                if legend_response.status_code == 200:
+                    legend_img = Image.open(BytesIO(legend_response.content)).convert("RGBA")
+                    print("✅ Generated legend image")
+                else:
+                    print(f"⚠️ Could not get legend, status code: {legend_response.status_code}")
+                    # Create a fallback legend
+                    legend_img = Image.new('RGBA', (200, 20), (255, 255, 255, 255))
+                    draw = ImageDraw.Draw(legend_img)
+                    
+                    # Draw a gradient based on the colormap name
+                    if colormap == 'viridis':
+                        # Blue to yellow-green gradient for viridis
+                        for x in range(200):
+                            r = min(255, int((x/200) * 255))
+                            g = min(255, int((x/200) * 200))
+                            b = max(0, 255 - int((x/200) * 200))
+                            draw.line([(x, 0), (x, 20)], fill=(r, g, b, 255))
+                    else:
+                        # Generic gradient for other colormaps
+                        for x in range(200):
+                            draw.line([(x, 0), (x, 20)], fill=(int((x/200) * 255), 
+                                                              int((1-(x/200)) * 255), 
+                                                              int(127 * abs(math.sin(x/32))), 255))
+                    print("✅ Created fallback legend image")
+            except Exception as legend_err:
+                print(f"⚠️ Error getting legend: {legend_err}")
+                # Create a simple grayscale legend as fallback
+                legend_img = Image.new('RGBA', (200, 20), (255, 255, 255, 255))
+                draw = ImageDraw.Draw(legend_img)
+                for x in range(200):
+                    color = int(x * 255 / 200)
+                    draw.line([(x, 0), (x, 20)], fill=(color, color, color, 255))
+                print("✅ Created simple grayscale legend as fallback")
+        
+        # Process each COG
         for cog in selected_cogs:
             try:
+                # Generate and download the base image from TiTiler
                 titiler_url = generate_titiler_url(cog, input_data)
                 img = download_image(titiler_url)
-                images.append(img)
-                print(f"✅ Added image from {cog['filename']} to GIF")
+                
+                # Get image dimensions
+                img_width, img_height = img.size
+                
+                # Create a larger canvas to add text and legend
+                # Add 100px at the top for datetime and file info
+                canvas = Image.new('RGBA', (img_width, img_height + 100), (255, 255, 255, 255))
+                canvas.paste(img, (0, 100))  # Paste original image below the header
+                
+                # Create a drawing context
+                draw = ImageDraw.Draw(canvas)
+                
+                # Load a font
+                try:
+                    font = ImageFont.truetype("DejaVuSans.ttf", 14)
+                    small_font = ImageFont.truetype("DejaVuSans.ttf", 12)
+                except IOError:
+                    # Fallback to default font
+                    font = ImageFont.load_default()
+                    small_font = ImageFont.load_default()
+                
+                # Format datetime for display
+                datetime_str = convert_epoch_to_datetime(cog["aquisition_datetime"]).strftime("%Y-%m-%d %H:%M:%S UTC")
+                
+                # Format band name correctly whether it's a string or a list
+                band_name = input_data['bandName']
+                if isinstance(band_name, list):
+                    band_name = ", ".join(band_name)
+                
+                # Add file information
+                file_info = f"Satellite: {input_data['SatelliteId']} | Product: {input_data['productType']} | Band: {band_name}"
+                
+                # Draw text for datetime and file info
+                draw.text((10, 10), datetime_str, fill=(0, 0, 0, 255), font=font)
+                draw.text((10, 40), file_info, fill=(0, 0, 0, 255), font=small_font)
+                draw.text((10, 65), f"File: {cog['filename']}", fill=(0, 0, 0, 255), font=small_font)
+                
+                # Add the ISRO logo in the bottom-right corner if available
+                if logo_img:
+                    logo_position = (img_width - logo_img.width - 10, img_height + 100 - logo_img.height - 10)
+                    canvas.paste(logo_img, logo_position, logo_img)
+                
+                # Add legend at the bottom if available
+                if legend_img:
+                    legend_position_x = (img_width - legend_img.width) // 2  # Center horizontally
+                    legend_position_y = img_height + 70  # Near the bottom
+                    canvas.paste(legend_img, (legend_position_x, legend_position_y), legend_img)
+                    
+                    # Add min/max labels to the legend
+                    draw.text(
+                        (legend_position_x - 30, legend_position_y + 5), 
+                        "Min", 
+                        fill=(0, 0, 0, 255), 
+                        font=small_font
+                    )
+                    draw.text(
+                        (legend_position_x + legend_img.width + 5, legend_position_y + 5), 
+                        "Max", 
+                        fill=(0, 0, 0, 255), 
+                        font=small_font
+                    )
+                
+                enhanced_images.append(canvas)
+                print(f"✅ Added enhanced image from {cog['filename']} to GIF")
             except Exception as img_err:
-                print(f"❌ Error downloading image for {cog['filename']}: {img_err}")
-        gif_buffer = build_gif(images)
+                print(f"❌ Error processing image for {cog['filename']}: {img_err}")
+        
+        # Build the GIF with the enhanced images
+        if not enhanced_images:
+            print("⚠️ No enhanced images were created successfully")
+            # Create a default "error" image
+            error_img = Image.new('RGBA', (800, 400), (255, 255, 255, 255))
+            draw = ImageDraw.Draw(error_img)
+            
+            try:
+                font = ImageFont.truetype("DejaVuSans.ttf", 18)
+                small_font = ImageFont.truetype("DejaVuSans.ttf", 14)
+            except IOError:
+                font = ImageFont.load_default()
+                small_font = ImageFont.load_default()
+            
+            draw.text((50, 50), "Error Processing Images", fill=(255, 0, 0, 255), font=font)
+            draw.text((50, 100), "COGs were found but could not be processed into images.", 
+                     fill=(0, 0, 0, 255), font=small_font)
+            
+            enhanced_images = [error_img]
+        
+        gif_buffer = build_gif(enhanced_images)
         return send_file(gif_buffer, mimetype="image/gif", download_name="output.gif")
     except Exception as e:
         print(f"❌ Error in generate_gif_endpoint: {e}")
         return jsonify({"error": str(e)}), 500
+
 @app.route("/pointprobe", methods=["POST"])
 @swag_from({
     "tags": ["Probe"],
