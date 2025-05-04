@@ -613,9 +613,124 @@ def generate_gif_endpoint():
                 print(f"⚠️ Error loading ISRO logo: {e}")
                 logo_img = None
         
-        # Get legend image from TiTiler if colormap is specified
+        # Get statistical information for the first COG to create appropriate legend ranges
+        cog_stats = None
         legend_img = None
-        if input_data.get('colourmap'):
+        value_ranges = []
+        colors = []
+        
+        try:
+            # Get stats for the first COG to determine value ranges for the legend
+            if selected_cogs:
+                first_cog = selected_cogs[0]
+                first_cog_path = os.path.join(first_cog['filepath'], first_cog['filename'])
+                first_cog_url = f"file://{first_cog_path}"
+                
+                # Get stats from TiTiler
+                stats_url = f"{TITILER_BASE}/statistics?url={quote_plus(first_cog_url)}"
+                stats_response = requests.get(stats_url)
+                
+                if stats_response.status_code == 200:
+                    cog_stats = stats_response.json()
+                    print(f"✅ Got statistics for legend: {cog_stats}")
+                    
+                    # Extract min, max, and histogram information
+                    band_key = list(cog_stats.keys())[0]  # Usually 'b1'
+                    band_stats = cog_stats[band_key]
+                    
+                    min_val = band_stats.get('min', 0)
+                    max_val = band_stats.get('max', 255)
+                    
+                    # Create value ranges for legend
+                    if 'histogram' in band_stats and len(band_stats['histogram']) > 1:
+                        bins = band_stats['histogram'][1]
+                        value_ranges = [[bins[i], bins[i+1]] for i in range(len(bins)-1)]
+                    else:
+                        # Create default ranges if histogram not available
+                        step = (max_val - min_val) / 10
+                        value_ranges = [[min_val + step*i, min_val + step*(i+1)] for i in range(10)]
+                    
+                    # Generate colors for each range based on the selected colormap
+                    colormap = input_data.get('colourmap', 'viridis')
+                    
+                    # Import matplotlib for colormap generation
+                    import matplotlib.pyplot as plt
+                    from matplotlib import cm as mpl_cm
+                    
+                    # Get the colormap from matplotlib
+                    cmap = plt.get_cmap(colormap)
+                    
+                    # Create colors for each bin
+                    # Use the start value of each range to get a color
+                    start_values = [r[0] for r in value_ranges]
+                    
+                    # Normalize values to 0-1 range for colormap
+                    if min_val != max_val:
+                        norm_values = [(v - min_val) / (max_val - min_val) for v in start_values]
+                    else:
+                        norm_values = [0.5] * len(start_values)
+                    
+                    # Get RGBA colors from colormap
+                    rgba_colors = [cmap(v) for v in norm_values]
+                    
+                    # Convert to 0-255 range integers for PIL
+                    colors = [
+                        [int(r*255), int(g*255), int(b*255), 255] 
+                        for r, g, b, _ in rgba_colors
+                    ]
+                    
+                    # Create a custom legend image
+                    legend_width = 200
+                    legend_height = 40
+                    
+                    # Create the base legend image
+                    legend_img = Image.new('RGBA', (legend_width, legend_height), (255, 255, 255, 255))
+                    draw = ImageDraw.Draw(legend_img)
+                    
+                    # Draw color blocks
+                    block_width = legend_width / len(colors)
+                    for i, color in enumerate(colors):
+                        x0 = i * block_width
+                        x1 = (i + 1) * block_width
+                        y0 = 0
+                        y1 = legend_height - 20  # Leave space for text
+                        draw.rectangle([(x0, y0), (x1, y1)], fill=tuple(color))
+                    
+                    # Add min and max values text
+                    try:
+                        small_font = ImageFont.truetype("DejaVuSans.ttf", 10)
+                    except IOError:
+                        small_font = ImageFont.load_default()
+                    
+                    # Format values to be more readable (avoid long decimals)
+                    def format_value(val):
+                        if isinstance(val, (int, float)):
+                            if val == int(val):
+                                return str(int(val))
+                            return f"{val:.2f}"
+                        return str(val)
+                    
+                    min_text = format_value(min_val)
+                    max_text = format_value(max_val)
+                    
+                    # Draw min/max labels
+                    draw.text((0, legend_height - 15), min_text, fill=(0, 0, 0, 255), font=small_font)
+                    
+                    # Position max value on the right, accounting for text width
+                    max_text_width = draw.textlength(max_text, small_font)
+                    draw.text((legend_width - max_text_width, legend_height - 15), 
+                             max_text, fill=(0, 0, 0, 255), font=small_font)
+                    
+                    print("✅ Created custom interval-based legend image")
+                else:
+                    print(f"⚠️ Could not get statistics, status code: {stats_response.status_code}")
+                    # Fall back to default legend creation
+        except Exception as e:
+            print(f"⚠️ Error creating custom legend: {e}")
+            # Will fall back to default legend creation
+        
+        # If we couldn't create a custom legend, use the default TiTiler approach
+        if legend_img is None and input_data.get('colourmap'):
             try:
                 # Add known valid colormaps supported by TiTiler
                 valid_colormaps = [
@@ -627,12 +742,15 @@ def generate_gif_endpoint():
                 if colormap not in valid_colormaps:
                     colormap = 'viridis'  # Default to viridis if the requested colormap is not supported
                 
-                legend_url = f"{TITILER_BASE}/legend?colormap_name={colormap}&width=200&height=20"
+                # Use the correct endpoint for getting the legend
+                legend_url = f"{TITILER_BASE}/colormaps/{colormap}/legend.png?width=200&height=20"
+                print(f"Fetching legend from: {legend_url}")
+                
                 legend_response = requests.get(legend_url)
                 
                 if legend_response.status_code == 200:
                     legend_img = Image.open(BytesIO(legend_response.content)).convert("RGBA")
-                    print("✅ Generated legend image")
+                    print("✅ Generated legend image from TiTiler")
                 else:
                     print(f"⚠️ Could not get legend, status code: {legend_response.status_code}")
                     # Create a fallback legend
@@ -650,6 +768,7 @@ def generate_gif_endpoint():
                     else:
                         # Generic gradient for other colormaps
                         for x in range(200):
+                            import math  # Make sure math is imported
                             draw.line([(x, 0), (x, 20)], fill=(int((x/200) * 255), 
                                                               int((1-(x/200)) * 255), 
                                                               int(127 * abs(math.sin(x/32))), 255))
@@ -720,19 +839,21 @@ def generate_gif_endpoint():
                     legend_position_y = 50
                     canvas.paste(legend_img, (legend_position_x, legend_position_y), legend_img)
                     
-                    # Add min/max labels to the legend
-                    draw.text(
-                        (legend_position_x - 30, legend_position_y + 5), 
-                        "Min", 
-                        fill=(0, 0, 0, 255), 
-                        font=small_font
-                    )
-                    draw.text(
-                        (legend_position_x + legend_img.width + 5, legend_position_y + 5), 
-                        "Max", 
-                        fill=(0, 0, 0, 255), 
-                        font=small_font
-                    )
+                    # Only add min/max labels if not already part of the custom legend
+                    if legend_img.height < 30:  # The custom legend already includes the labels
+                        # Add min/max labels to the legend
+                        draw.text(
+                            (legend_position_x - 30, legend_position_y + 5), 
+                            "Min", 
+                            fill=(0, 0, 0, 255), 
+                            font=small_font
+                        )
+                        draw.text(
+                            (legend_position_x + legend_img.width + 5, legend_position_y + 5), 
+                            "Max", 
+                            fill=(0, 0, 0, 255), 
+                            font=small_font
+                        )
                 
                 enhanced_images.append(canvas)
                 print(f"✅ Added enhanced image from {cog['filename']} to GIF")
@@ -764,7 +885,7 @@ def generate_gif_endpoint():
     except Exception as e:
         print(f"❌ Error in generate_gif_endpoint: {e}")
         return jsonify({"error": str(e)}), 500
-
+    
 @app.route("/pointprobe", methods=["POST"])
 @swag_from({
     "tags": ["Probe"],
