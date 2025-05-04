@@ -606,8 +606,8 @@ def generate_gif_endpoint():
         if os.path.exists(logo_path):
             try:
                 logo_img = Image.open(logo_path).convert("RGBA")
-                # Resize logo to appropriate size (e.g., 10% of image width)
-                logo_img = logo_img.resize((100, 100), Image.Resampling.LANCZOS)
+                # Resize logo to appropriate size for header (smaller than before)
+                logo_img = logo_img.resize((80, 80), Image.Resampling.LANCZOS)
                 print("✅ Loaded ISRO logo")
             except Exception as e:
                 print(f"⚠️ Error loading ISRO logo: {e}")
@@ -627,7 +627,7 @@ def generate_gif_endpoint():
                 if colormap not in valid_colormaps:
                     colormap = 'viridis'  # Default to viridis if the requested colormap is not supported
                 
-                legend_url = f"{TITILER_BASE}/legend"
+                legend_url = f"{TITILER_BASE}/legend?colormap_name={colormap}&width=200&height=20"
                 legend_response = requests.get(legend_url)
                 
                 if legend_response.status_code == 200:
@@ -702,20 +702,22 @@ def generate_gif_endpoint():
                 # Add file information
                 file_info = f"Satellite: {input_data['SatelliteId']} | Product: {input_data['productType']} | Band: {band_name}"
                 
-                # Draw text for datetime and file info
+                # Draw text for datetime and file info (on the left side)
                 draw.text((10, 10), datetime_str, fill=(0, 0, 0, 255), font=font)
                 draw.text((10, 40), file_info, fill=(0, 0, 0, 255), font=small_font)
                 draw.text((10, 65), f"File: {cog['filename']}", fill=(0, 0, 0, 255), font=small_font)
                 
-                # Add the ISRO logo in the bottom-right corner if available
+                # Add the ISRO logo in the top-right corner of the header
                 if logo_img:
-                    logo_position = (img_width - logo_img.width - 10, img_height + 100 - logo_img.height - 10)
+                    logo_position = (img_width - logo_img.width - 10, 10)  # Top-right position
                     canvas.paste(logo_img, logo_position, logo_img)
                 
-                # Add legend at the bottom if available
+                # Add legend in the top-middle of the header
                 if legend_img:
-                    legend_position_x = (img_width - legend_img.width) // 2  # Center horizontally
-                    legend_position_y = img_height + 70  # Near the bottom
+                    # Center horizontally
+                    legend_position_x = (img_width - legend_img.width) // 2
+                    # Place in the middle of the header area
+                    legend_position_y = 50
                     canvas.paste(legend_img, (legend_position_x, legend_position_y), legend_img)
                     
                     # Add min/max labels to the legend
