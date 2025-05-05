@@ -242,62 +242,7 @@ def overlay_shapefile(img, transform, crs, show_country=True, show_states=True, 
             crs = CRS.from_epsg(4326)
         
         # Draw country boundary
-        if show_country and os.path.exists(country_path):
-            try:
-                country_gdf = gpd.read_file(country_path)
                 
-                # Ensure the shapefile has a CRS set
-                if country_gdf.crs is None:
-                    print("Setting CRS for country shapefile to EPSG:4326")
-                    country_gdf.set_crs(epsg=4326, inplace=True)
-                
-                # Reproject to the image CRS if needed
-                if country_gdf.crs != crs:
-                    try:
-                        country_gdf = country_gdf.to_crs(crs)
-                    except Exception as e:
-                        print(f"Error reprojecting country boundary: {e}")
-                        # Try using pyproj directly
-                        from pyproj import Transformer
-                        transformer = Transformer.from_crs(country_gdf.crs, crs, always_xy=True)
-                        
-                        def transform_geom(geom):
-                            if geom is None or not geom.is_valid:
-                                return None
-                            return shapely.ops.transform(
-                                lambda x, y: transformer.transform(x, y), 
-                                geom
-                            )
-                        
-                        country_gdf['geometry'] = country_gdf['geometry'].apply(transform_geom)
-                        country_gdf = country_gdf[country_gdf.geometry.notnull()]
-                        if len(country_gdf) > 0:
-                            country_gdf.set_crs(crs, inplace=True)
-                
-                # Directly draw each polygon's exterior on our overlay using PIL
-                for _, row in country_gdf.iterrows():
-                    geom = row['geometry']
-                    if geom is None or not hasattr(geom, 'exterior'):
-                        continue
-                        
-                    # Get the exterior coordinates of the polygon
-                    if hasattr(geom, 'geoms'):  # MultiPolygon
-                        for subgeom in geom.geoms:
-                            if not hasattr(subgeom, 'exterior'):
-                                continue
-                            coords = subgeom.exterior.coords
-                            pixel_coords = [~transform * (x, y) for x, y in coords]
-                            # Draw with thicker blue line for country boundary
-                            draw.line(pixel_coords, fill=(0, 0, 255, 255), width=int(line_width*3))
-                    else:  # Single Polygon
-                        coords = geom.exterior.coords
-                        pixel_coords = [~transform * (x, y) for x, y in coords]
-                        # Draw with thicker blue line for country boundary
-                        draw.line(pixel_coords, fill=(0, 0, 255, 255), width=int(line_width*3))
-                
-            except Exception as e:
-                print(f"Error plotting country boundary: {e}")
-        
         # Draw state boundaries
         if show_states and os.path.exists(state_path):
             try:
@@ -354,7 +299,62 @@ def overlay_shapefile(img, transform, crs, show_country=True, show_states=True, 
                 
             except Exception as e:
                 print(f"Error plotting state boundaries: {e}")
-        
+        if show_country and os.path.exists(country_path):
+            try:
+                country_gdf = gpd.read_file(country_path)
+                
+                # Ensure the shapefile has a CRS set
+                if country_gdf.crs is None:
+                    print("Setting CRS for country shapefile to EPSG:4326")
+                    country_gdf.set_crs(epsg=4326, inplace=True)
+                
+                # Reproject to the image CRS if needed
+                if country_gdf.crs != crs:
+                    try:
+                        country_gdf = country_gdf.to_crs(crs)
+                    except Exception as e:
+                        print(f"Error reprojecting country boundary: {e}")
+                        # Try using pyproj directly
+                        from pyproj import Transformer
+                        transformer = Transformer.from_crs(country_gdf.crs, crs, always_xy=True)
+                        
+                        def transform_geom(geom):
+                            if geom is None or not geom.is_valid:
+                                return None
+                            return shapely.ops.transform(
+                                lambda x, y: transformer.transform(x, y), 
+                                geom
+                            )
+                        
+                        country_gdf['geometry'] = country_gdf['geometry'].apply(transform_geom)
+                        country_gdf = country_gdf[country_gdf.geometry.notnull()]
+                        if len(country_gdf) > 0:
+                            country_gdf.set_crs(crs, inplace=True)
+                
+                # Directly draw each polygon's exterior on our overlay using PIL
+                for _, row in country_gdf.iterrows():
+                    geom = row['geometry']
+                    if geom is None or not hasattr(geom, 'exterior'):
+                        continue
+                        
+                    # Get the exterior coordinates of the polygon
+                    if hasattr(geom, 'geoms'):  # MultiPolygon
+                        for subgeom in geom.geoms:
+                            if not hasattr(subgeom, 'exterior'):
+                                continue
+                            coords = subgeom.exterior.coords
+                            pixel_coords = [~transform * (x, y) for x, y in coords]
+                            # Draw with thicker blue line for country boundary
+                            draw.line(pixel_coords, fill=(0, 0, 255, 255), width=int(line_width*3))
+                    else:  # Single Polygon
+                        coords = geom.exterior.coords
+                        pixel_coords = [~transform * (x, y) for x, y in coords]
+                        # Draw with thicker blue line for country boundary
+                        draw.line(pixel_coords, fill=(0, 0, 255, 255), width=int(line_width*3))
+                
+            except Exception as e:
+                print(f"Error plotting country boundary: {e}")
+
         # Add a simple legend to the bottom right
         if show_country or show_states:
             legend_width = 150
