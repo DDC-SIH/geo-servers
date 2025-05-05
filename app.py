@@ -238,10 +238,90 @@ def download_raw_layers():
         zip_path = os.path.join(temp_dir, "raw_layers.zip")
 
         def download_single(index, direct_url):
-            path = os.path.join(temp_dir, f"layer_{index}.tiff")
+            path = os.path.join(temp_dir, f"layer_{index}_original.tiff")
             download_from_titiler(direct_url, path)
-            return path
-
+            
+            # Add white header region with file details and ISRO logo
+            try:
+                # Open the downloaded image
+                with rasterio.open(path) as src:
+                    # Read image data
+                    if src.count >= 3:
+                        img_data = src.read([1, 2, 3])
+                        img_data = reshape_as_image(img_data)
+                    else:
+                        img_data = src.read(1)
+                        img_data = np.stack([img_data]*3, axis=2)
+                    
+                    # Convert to 8-bit if needed
+                    if img_data.dtype != np.uint8:
+                        img_data = ((img_data / img_data.max()) * 255).astype(np.uint8)
+                    
+                    # Convert to PIL image
+                    img = Image.fromarray(img_data)
+                    
+                    # Get image dimensions
+                    img_width, img_height = img.size
+                    
+                    # Create a larger canvas with white header
+                    canvas = Image.new('RGBA', (img_width, img_height + 100), (255, 255, 255, 255))
+                    canvas.paste(img, (0, 100))  # Paste original image below the header
+                    
+                    # Create a drawing context
+                    draw = ImageDraw.Draw(canvas)
+                    
+                    # Load a font
+                    try:
+                        font = ImageFont.truetype("DejaVuSans.ttf", 14)
+                        small_font = ImageFont.truetype("DejaVuSans.ttf", 12)
+                    except IOError:
+                        # Fallback to default font
+                        font = ImageFont.load_default()
+                        small_font = ImageFont.load_default()
+                    
+                    # Parse URL to get file details
+                    filename = f"Layer {index}"
+                    url_parts = direct_url.split('?')
+                    if len(url_parts) > 1:
+                        query_params = url_parts[1].split('&')
+                        for param in query_params:
+                            if param.startswith('url='):
+                                path_param = unquote(param[4:])
+                                filename = os.path.basename(path_param)
+                                break
+                    
+                    # Current date and time
+                    import datetime
+                    current_datetime = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    
+                    # Draw text for datetime and file info (on the left side)
+                    draw.text((10, 10), current_datetime, fill=(0, 0, 0, 255), font=font)
+                    draw.text((10, 40), f"Layer: {index}", fill=(0, 0, 0, 255), font=small_font)
+                    draw.text((10, 65), f"File: {filename}", fill=(0, 0, 0, 255), font=small_font)
+                    
+                    # Add the ISRO logo in the top-right corner of the header
+                    logo_path = "/home/sbn/souradip/geo-servers/Indian_Space_Research_Organisation_Logo.svg.png"
+                    if os.path.exists(logo_path):
+                        try:
+                            logo_img = Image.open(logo_path).convert("RGBA")
+                            # Resize logo to appropriate size
+                            logo_img = logo_img.resize((80, 80), Image.Resampling.LANCZOS)
+                            logo_position = (img_width - logo_img.width - 10, 10)  # Top-right position
+                            canvas.paste(logo_img, logo_position, logo_img)
+                        except Exception as e:
+                            print(f"Error loading ISRO logo: {e}")
+                    
+                    # Save the enhanced image
+                    enhanced_path = os.path.join(temp_dir, f"layer_{index}.tiff")
+                    canvas.save(enhanced_path, format="TIFF")
+                    
+                    return enhanced_path
+                
+            except Exception as e:
+                print(f"Error adding header to image {index}: {e}")
+                # If enhancement fails, return the original file
+                return path
+        
         with ThreadPoolExecutor() as executor:
             futures = [executor.submit(download_single, i, url) for i, url in enumerate(urls)]
             downloaded_files = [f.result() for f in futures]
@@ -321,6 +401,7 @@ def stack_layers():
             return jsonify({"error": "'data' should be a list of layer objects."}), 400
 
         temp_dir = tempfile.mkdtemp()
+        stacked_path = os.path.join(temp_dir, f"stacked_output_original.{output_format if output_format != 'tif' else 'tiff'}")
         output_path = os.path.join(temp_dir, f"stacked_output.{output_format if output_format != 'tif' else 'tiff'}")
 
         sorted_layers = sorted(layers, key=lambda x: x.get('zIndex', 0))
@@ -381,32 +462,118 @@ def stack_layers():
 
         rgb_data = stacked_data[..., :3]
 
+        # First create the basic version
         if output_format in ["tiff", "tif"]:
-            rgb_data = rgb_data.transpose(2, 0, 1)
+            rgb_data_transposed = rgb_data.transpose(2, 0, 1)
             with rasterio.open(
-                output_path,
+                stacked_path,
                 'w',
                 driver='GTiff',
                 height=ref_height,
                 width=ref_width,
                 count=3,
-                dtype=rgb_data.dtype,
+                dtype=rgb_data_transposed.dtype,
                 crs=ref_crs,
                 transform=ref_transform
             ) as dst:
-                dst.write(rgb_data)
+                dst.write(rgb_data_transposed)
 
         elif output_format in ["jpeg", "jpg", "png", "webp"]:
             image = Image.fromarray(rgb_data)
             save_format = "JPEG" if output_format == "jpg" else output_format.upper()
-            image.save(output_path, format=save_format)
-
+            image.save(stacked_path, format=save_format)
 
         elif output_format == "npy":
-            np.save(output_path, rgb_data)
+            np.save(stacked_path, rgb_data)
 
         else:
             return jsonify({"error": f"Unsupported format: {output_format}"}), 400
+        
+        # Now enhance the image with header
+        try:
+            # Create header region for the stacked image
+            if output_format in ["jpeg", "jpg", "png", "webp", "tiff", "tif"]:
+                # Load the stacked image
+                if output_format in ["tiff", "tif"]:
+                    with rasterio.open(stacked_path) as src:
+                        if src.count >= 3:
+                            img_data = src.read([1, 2, 3])
+                            img_data = reshape_as_image(img_data)
+                        else:
+                            img_data = src.read(1)
+                            img_data = np.stack([img_data]*3, axis=2)
+                        
+                        if img_data.dtype != np.uint8:
+                            img_data = ((img_data / img_data.max()) * 255).astype(np.uint8)
+                        
+                        img = Image.fromarray(img_data)
+                else:
+                    img = Image.open(stacked_path)
+                
+                # Get image dimensions
+                img_width, img_height = img.size
+                
+                # Create a larger canvas with white header
+                canvas = Image.new('RGBA', (img_width, img_height + 100), (255, 255, 255, 255))
+                canvas.paste(img, (0, 100))  # Paste original image below the header
+                
+                # Create a drawing context
+                draw = ImageDraw.Draw(canvas)
+                
+                # Load a font
+                try:
+                    font = ImageFont.truetype("DejaVuSans.ttf", 14)
+                    small_font = ImageFont.truetype("DejaVuSans.ttf", 12)
+                except IOError:
+                    # Fallback to default font
+                    font = ImageFont.load_default()
+                    small_font = ImageFont.load_default()
+                
+                # Current date and time
+                import datetime
+                current_datetime = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                
+                # File details
+                layer_info = f"Stacked Image: {len(layers)} layers"
+                
+                # Get transparency values as a string
+                transparencies = [f"{layer.get('transparency', 1.0):.2f}" for layer in sorted_layers]
+                transparency_info = f"Transparencies: {', '.join(transparencies)}"
+                
+                # Draw text information
+                draw.text((10, 10), current_datetime, fill=(0, 0, 0, 255), font=font)
+                draw.text((10, 40), layer_info, fill=(0, 0, 0, 255), font=small_font)
+                draw.text((10, 65), transparency_info, fill=(0, 0, 0, 255), font=small_font)
+                
+                # Add the ISRO logo in the top-right corner of the header
+                logo_path = "/home/sbn/souradip/geo-servers/Indian_Space_Research_Organisation_Logo.svg.png"
+                if os.path.exists(logo_path):
+                    try:
+                        logo_img = Image.open(logo_path).convert("RGBA")
+                        # Resize logo to appropriate size
+                        logo_img = logo_img.resize((80, 80), Image.Resampling.LANCZOS)
+                        logo_position = (img_width - logo_img.width - 10, 10)  # Top-right position
+                        canvas.paste(logo_img, logo_position, logo_img)
+                    except Exception as e:
+                        print(f"Error loading ISRO logo: {e}")
+                
+                # Save the enhanced image
+                if output_format in ["tiff", "tif"]:
+                    # Convert to RGB if needed before saving
+                    if canvas.mode != 'RGB':
+                        canvas = canvas.convert('RGB')
+                    canvas.save(output_path, format="TIFF")
+                else:
+                    save_format = "JPEG" if output_format == "jpg" else output_format.upper()
+                    canvas.save(output_path, format=save_format)
+            else:
+                # For non-image formats like NPY, just use the original output
+                output_path = stacked_path
+                
+        except Exception as e:
+            print(f"Error adding header to stacked image: {e}")
+            # If enhancement fails, use the original stacked image
+            output_path = stacked_path
 
         return send_file(output_path, as_attachment=True, download_name=f"stacked_layers.{output_format}")
 
@@ -416,7 +583,7 @@ def stack_layers():
     finally:
         if 'temp_dir' in locals():
             shutil.rmtree(temp_dir, ignore_errors=True)
-
+            
 @app.route("/generate-gif", methods=["POST"])
 @swag_from({
     'tags': ['GIF Generation'],
