@@ -232,9 +232,9 @@ def overlay_shapefile(img, transform, crs, show_country=True, show_states=True, 
         overlay = Image.new('RGBA', (width, height), (0, 0, 0, 0))
         draw = ImageDraw.Draw(overlay)
         
-        # Load country boundary shapefile
-        country_path = "/home/sbn/souradip/geo-servers/India_Country_Boundary.shp"
-        state_path = "/home/sbn/souradip/geo-servers/India_State_Boundary.shp"
+        # Correct shapefile paths
+        country_path = "/home/sbn/souradip/geo-servers/shapefiles/India_Country_Boundary.shp"
+        state_path = "/home/sbn/souradip/geo-servers/shapefiles/India_State_Boundary.shp"
         
         # Ensure CRS is defined
         if crs is None:
@@ -344,16 +344,12 @@ def overlay_shapefile(img, transform, crs, show_country=True, show_states=True, 
                                 continue
                             coords = subgeom.exterior.coords
                             pixel_coords = [~transform * (x, y) for x, y in coords]
-                            # Draw with white line for state boundaries (dashed effect)
-                            dash_length = 5  # pixels for dash pattern
-                            for i in range(0, len(pixel_coords)-1, 2):
-                                draw.line([pixel_coords[i], pixel_coords[i+1]], 
-                                          fill=(255, 255, 255, 255), 
-                                          width=int(line_width*2))
+                            # Draw with white line for state boundaries
+                            draw.line(pixel_coords, fill=(255, 255, 255, 255), width=int(line_width*2))
                     else:  # Single Polygon
                         coords = geom.exterior.coords
                         pixel_coords = [~transform * (x, y) for x, y in coords]
-                        # Draw with white line for state boundaries (solid for simplicity)
+                        # Draw with white line for state boundaries
                         draw.line(pixel_coords, fill=(255, 255, 255, 255), width=int(line_width*2))
                 
             except Exception as e:
@@ -402,6 +398,8 @@ def overlay_shapefile(img, transform, crs, show_country=True, show_states=True, 
         traceback.print_exc()
         # Return the original image if overlay fails
         return img
+
+@app.route('/download/raw', methods=['POST'])
 @swag_from({
     'tags': ['Download'],
     'description': 'Download multiple raster layers from direct TiTiler URLs and zip them.',
