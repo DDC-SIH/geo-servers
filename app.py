@@ -636,7 +636,7 @@ def stack_layers():
         req = request.json
         if not req or not isinstance(req, dict) or 'data' not in req:
             return jsonify({"error": "Expected a JSON object with 'data' list and optional 'format'."}), 400
-
+        print(req)
         layers = req['data']
         output_format = req.get('format', 'tiff').lower()
 
@@ -644,11 +644,12 @@ def stack_layers():
             return jsonify({"error": "'data' should be a list of layer objects."}), 400
 
         temp_dir = tempfile.mkdtemp()
-        stacked_path = os.path.join(temp_dir, f"stacked_output_original.{output_format if output_format != 'tif' else 'tiff'}")
-        output_path = os.path.join(temp_dir, f"stacked_output.{output_format if output_format != 'tif' else 'tiff'}")
+        interim_tiff_path = os.path.join(temp_dir, "stacked_output_original.tiff")
+        overlaid_tiff_path = os.path.join(temp_dir, "stacked_output_with_overlay.tiff")
+        output_path = os.path.join(temp_dir, f"stacked_output.{output_format}")
 
+        # Process layers and create interim TIFF
         sorted_layers = sorted(layers, key=lambda x: x.get('zIndex', 0))
-
         processed_layers = []
         ref_transform = ref_crs = ref_width = ref_height = None
         
@@ -682,11 +683,37 @@ def stack_layers():
 
         def download_layer(index, layer):
             url = layer.get('directURL')
+            # Replace format extension with .tif to ensure we get TIFF data
+            # Split URL at potential format extensions and keep the base part
+            base_url_parts = url.split('/preview.')
+            if len(base_url_parts) > 1:
+                # Extract the query string part (everything after the ?)
+                parts = base_url_parts[1].split('?')
+                if len(parts) > 1:
+                    query_string = parts[1]
+                    # Replace any extension with .tif
+                    url = f"{base_url_parts[0]}/preview.tif?{query_string}"
+                else:
+                    # No query parameters
+                    url = f"{base_url_parts[0]}/preview.tif"
+            else:
+                # Handle other URL patterns (bbox, etc.)
+                url_pattern_parts = url.split('/bbox/')
+                if len(url_pattern_parts) > 1:
+                    bbox_and_format = url_pattern_parts[1].split('.')
+                    if len(bbox_and_format) > 1:
+                        # Replace the format after bbox coordinates
+                        bbox_coords = bbox_and_format[0]
+                        query_part = ''
+                        if '?' in bbox_and_format[1]:
+                            query_part = '?' + bbox_and_format[1].split('?')[1]
+                        url = f"{url_pattern_parts[0]}/bbox/{bbox_coords}.tif{query_part}"
+            
+            print(f"Modified URL for TIFF download: {url}")
             trans = float(layer.get('transparency', 1.0))
             path = os.path.join(temp_dir, f"layer_{index}.tiff")
             download_from_titiler(url, path)
             return path, trans
-
         with ThreadPoolExecutor() as executor:
             futures = [executor.submit(download_layer, i, l) for i, l in enumerate(sorted_layers)]
             results = [f.result() for f in futures]
@@ -733,140 +760,133 @@ def stack_layers():
 
         rgb_data = stacked_data[..., :3]
 
-        # First create the basic version
-        if output_format in ["tiff", "tif"]:
-            rgb_data_transposed = rgb_data.transpose(2, 0, 1)
-            with rasterio.open(
-                stacked_path,
-                'w',
-                driver='GTiff',
-                height=ref_height,
-                width=ref_width,
-                count=3,
-                dtype=rgb_data_transposed.dtype,
-                crs=ref_crs,
-                transform=ref_transform
-            ) as dst:
-                dst.write(rgb_data_transposed)
-
-        elif output_format in ["jpeg", "jpg", "png", "webp"]:
-            image = Image.fromarray(rgb_data)
-            save_format = "JPEG" if output_format == "jpg" else output_format.upper()
-            image.save(stacked_path, format=save_format)
-
-        elif output_format == "npy":
-            np.save(stacked_path, rgb_data)
-
-        else:
-            return jsonify({"error": f"Unsupported format: {output_format}"}), 400
+        # STEP 1: Create a base TIFF file with geospatial reference data
+        rgb_data_transposed = rgb_data.transpose(2, 0, 1)
         
-        # Now enhance the image with header
+        # Ensure CRS is set to avoid None warning
+        if ref_crs is None:
+            print("Warning: CRS is None, defaulting to EPSG:4326")
+            ref_crs = CRS.from_epsg(4326)
+            
+        with rasterio.open(
+            interim_tiff_path,
+            'w',
+            driver='GTiff',
+            height=ref_height,
+            width=ref_width,
+            count=3,
+            dtype=rgb_data_transposed.dtype,
+            crs=ref_crs,
+            transform=ref_transform
+        ) as dst:
+            dst.write(rgb_data_transposed)
+
+        # STEP 2: Apply shapefile overlay using overlay_shapefile function
         try:
-            # Create header region for the stacked image
-            if output_format in ["jpeg", "jpg", "png", "webp", "tiff", "tif"]:
-                # Load the stacked image
-                if output_format in ["tiff", "tif"]:
-                    with rasterio.open(stacked_path) as src:
-                        # Get transform and CRS for shapefile overlay
-                        img_transform = src.transform
-                        img_crs = src.crs
-                        
-                        if src.count >= 3:
-                            img_data = src.read([1, 2, 3])
-                            img_data = reshape_as_image(img_data)
-                        else:
-                            img_data = src.read(1)
-                            img_data = np.stack([img_data]*3, axis=2)
-                        
-                        if img_data.dtype != np.uint8:
-                            img_data = ((img_data / img_data.max()) * 255).astype(np.uint8)
-                        
-                        img = Image.fromarray(img_data)
+            with rasterio.open(interim_tiff_path) as src:
+                img_transform = src.transform
+                img_crs = src.crs
+                
+                if src.count >= 3:
+                    img_data = src.read([1, 2, 3])
+                    img_data = reshape_as_image(img_data)
                 else:
-                    img = Image.open(stacked_path)
-                    img_transform = ref_transform
-                    img_crs = ref_crs
+                    img_data = src.read(1)
+                    img_data = np.stack([img_data]*3, axis=2)
                 
-                # Get image dimensions
-                img_width, img_height = img.size
+                if img_data.dtype != np.uint8:
+                    img_data = ((img_data / img_data.max()) * 255).astype(np.uint8)
                 
-                # Apply shapefile overlay before adding header
-                try:
-                    img_with_overlay = overlay_shapefile(
-                        img, 
-                        img_transform, 
-                        img_crs,
-                        show_country=True,
-                        show_states=True
-                    )
-                    img = img_with_overlay
-                except Exception as e:
-                    print(f"Error applying shapefile overlay to stacked image: {e}")
+                # Convert to PIL Image for overlay_shapefile function
+                img = Image.fromarray(img_data).convert("RGBA")
                 
-                # Create a larger canvas with white header
+                # Use the overlay_shapefile function to apply shapefile boundaries
+                img_with_overlay = overlay_shapefile(
+                    img, 
+                    img_transform, 
+                    img_crs,
+                    show_country=True,
+                    show_states=True,
+                    line_width=1.0
+                )
+                
+                # Create canvas with header
+                img_width, img_height = img_with_overlay.size
                 canvas = Image.new('RGBA', (img_width, img_height + 100), (255, 255, 255, 255))
-                canvas.paste(img, (0, 100))  # Paste original image with overlay below the header
+                canvas.paste(img_with_overlay, (0, 100))
                 
-                # Create a drawing context
+                # Add header information
                 draw = ImageDraw.Draw(canvas)
                 
-                # Load a font
                 try:
                     font = ImageFont.truetype("DejaVuSans.ttf", 14)
                     small_font = ImageFont.truetype("DejaVuSans.ttf", 12)
                 except IOError:
-                    # Fallback to default font
                     font = ImageFont.load_default()
                     small_font = ImageFont.load_default()
                 
-                # Current date and time
-                import datetime
+                # Add header text
                 current_datetime = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                
-                # Create product information string
                 product_info = f"Satellite: {satellite_id} | Product: {product_type} | Band: {band_name}"
-                
-                # Layer information
                 layer_count_info = f"Stacked Image: {len(layers)} layers"
-                
-                # Get transparency values as a string
                 transparencies = [f"{layer.get('transparency', 1.0):.2f}" for layer in sorted_layers]
                 transparency_info = f"Transparencies: {', '.join(transparencies)}"
                 
-                # Draw text information
                 draw.text((10, 10), current_datetime, fill=(0, 0, 0, 255), font=font)
                 draw.text((10, 40), product_info, fill=(0, 0, 0, 255), font=small_font)
                 draw.text((10, 65), f"{layer_count_info} | {transparency_info}", fill=(0, 0, 0, 255), font=small_font)
                 
-                # Add the ISRO logo in the top-right corner of the header
+                # Add ISRO logo
                 logo_path = "/home/sbn/souradip/geo-servers/Indian_Space_Research_Organisation_Logo.svg.png"
                 if os.path.exists(logo_path):
                     try:
                         logo_img = Image.open(logo_path).convert("RGBA")
-                        # Resize logo to appropriate size
                         logo_img = logo_img.resize((80, 80), Image.Resampling.LANCZOS)
-                        logo_position = (img_width - logo_img.width - 10, 10)  # Top-right position
+                        logo_position = (img_width - logo_img.width - 10, 10)
                         canvas.paste(logo_img, logo_position, logo_img)
                     except Exception as e:
                         print(f"Error loading ISRO logo: {e}")
                 
-                # Save the enhanced image
+                # STEP 3: Save the canvas with overlay as a complete TIFF first
+                print("Saving as TIFF with overlay")
+                canvas.save(overlaid_tiff_path, format="TIFF")
+                
+                # STEP 4: Convert the complete TIFF to the requested format
                 if output_format in ["tiff", "tif"]:
-                    # Convert to RGB if needed before saving
-                    if canvas.mode != 'RGB':
-                        canvas = canvas.convert('RGB')
-                    canvas.save(output_path, format="TIFF")
+                    # For TIFF output, just use the overlaid TIFF
+                    print(f"Using TIFF as final output format")
+                    shutil.copy(overlaid_tiff_path, output_path)
                 else:
-                    save_format = "JPEG" if output_format == "jpg" else output_format.upper()
-                    canvas.save(output_path, format=save_format)
-            else:
-                # For non-image formats like NPY, just use the original output
-                output_path = stacked_path
+                    # For non-TIFF formats, use PIL to directly convert from the canvas
+                    print(f"Converting to {output_format} format")
+                    if output_format in ["jpeg", "jpg"]:
+                        canvas.convert("RGB").save(output_path, format="JPEG", quality=95)
+                    elif output_format == "png":
+                        canvas.save(output_path, format="PNG")
+                    elif output_format == "webp":
+                        canvas.save(output_path, format="WEBP", quality=95)
+                    elif output_format == "npy":
+                        np_array = np.array(canvas)
+                        np.save(output_path, np_array)
+                    else:
+                        return jsonify({"error": f"Unsupported format: {output_format}"}), 400
+                    
+                print(f"Successfully converted {overlaid_tiff_path} to {output_path}")
                 
         except Exception as e:
-            print(f"Error adding header to stacked image: {e}")
-            # If enhancement fails, use the original stacked image
-            output_path = stacked_path
+            print(f"Error processing image with shapefile overlay: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            # Fallback to original data if overlay fails
+            if output_format in ["tiff", "tif"]:
+                shutil.copy(interim_tiff_path, output_path)
+            elif output_format in ["jpeg", "jpg", "png", "webp"]:
+                image = Image.fromarray(rgb_data)
+                save_format = "JPEG" if output_format in ["jpg", "jpeg"] else output_format.upper()
+                image.save(output_path, format=save_format)
+            elif output_format == "npy":
+                np.save(output_path, rgb_data)
 
         return send_file(output_path, as_attachment=True, download_name=f"stacked_layers.{output_format}")
 
