@@ -282,21 +282,41 @@ def download_raw_layers():
                     # Parse URL to get file details
                     filename = f"Layer {index}"
                     url_parts = direct_url.split('?')
+                    
+                    # Extract product information from URL
+                    satellite_id = "Unknown"
+                    product_type = "Unknown"
+                    band_name = "Unknown"
+                    
                     if len(url_parts) > 1:
                         query_params = url_parts[1].split('&')
                         for param in query_params:
                             if param.startswith('url='):
                                 path_param = unquote(param[4:])
                                 filename = os.path.basename(path_param)
-                                break
+                                
+                                # Try to extract product information from filename
+                                name_parts = filename.split('_')
+                                if len(name_parts) >= 2:
+                                    satellite_id = name_parts[0]
+                                if len(name_parts) >= 3:
+                                    product_type = name_parts[1]
+                                if "band" in direct_url.lower() or "bidx" in direct_url.lower():
+                                    for p in query_params:
+                                        if p.startswith('bidx='):
+                                            band_name = f"Band {p.split('=')[1]}"
+                                            break
                     
                     # Current date and time
                     import datetime
                     current_datetime = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     
+                    # Create file information string
+                    file_info = f"Satellite: {satellite_id} | Product: {product_type} | Band: {band_name}"
+                    
                     # Draw text for datetime and file info (on the left side)
                     draw.text((10, 10), current_datetime, fill=(0, 0, 0, 255), font=font)
-                    draw.text((10, 40), f"Layer: {index}", fill=(0, 0, 0, 255), font=small_font)
+                    draw.text((10, 40), file_info, fill=(0, 0, 0, 255), font=small_font)
                     draw.text((10, 65), f"File: {filename}", fill=(0, 0, 0, 255), font=small_font)
                     
                     # Add the ISRO logo in the top-right corner of the header
@@ -408,6 +428,34 @@ def stack_layers():
 
         processed_layers = []
         ref_transform = ref_crs = ref_width = ref_height = None
+        
+        # Extract product information from first URL when available
+        satellite_id = "Unknown"
+        product_type = "Unknown"
+        band_name = "Unknown"
+        
+        if sorted_layers and 'directURL' in sorted_layers[0]:
+            url = sorted_layers[0]['directURL']
+            url_parts = url.split('?')
+            
+            if len(url_parts) > 1:
+                query_params = url_parts[1].split('&')
+                for param in query_params:
+                    if param.startswith('url='):
+                        path_param = unquote(param[4:])
+                        filename = os.path.basename(path_param)
+                        
+                        # Try to extract product information from filename
+                        name_parts = filename.split('_')
+                        if len(name_parts) >= 2:
+                            satellite_id = name_parts[0]
+                        if len(name_parts) >= 3:
+                            product_type = name_parts[1]
+                        if "band" in url.lower() or "bidx" in url.lower():
+                            for p in query_params:
+                                if p.startswith('bidx='):
+                                    band_name = f"Band {p.split('=')[1]}"
+                                    break
 
         def download_layer(index, layer):
             url = layer.get('directURL')
@@ -533,8 +581,11 @@ def stack_layers():
                 import datetime
                 current_datetime = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 
-                # File details
-                layer_info = f"Stacked Image: {len(layers)} layers"
+                # Create product information string
+                product_info = f"Satellite: {satellite_id} | Product: {product_type}"
+                
+                # Layer information
+                layer_count_info = f"Stacked Image: {len(layers)} layers"
                 
                 # Get transparency values as a string
                 transparencies = [f"{layer.get('transparency', 1.0):.2f}" for layer in sorted_layers]
@@ -542,8 +593,8 @@ def stack_layers():
                 
                 # Draw text information
                 draw.text((10, 10), current_datetime, fill=(0, 0, 0, 255), font=font)
-                draw.text((10, 40), layer_info, fill=(0, 0, 0, 255), font=small_font)
-                draw.text((10, 65), transparency_info, fill=(0, 0, 0, 255), font=small_font)
+                draw.text((10, 40), product_info, fill=(0, 0, 0, 255), font=small_font)
+                draw.text((10, 65), f"{layer_count_info} | {transparency_info}", fill=(0, 0, 0, 255), font=small_font)
                 
                 # Add the ISRO logo in the top-right corner of the header
                 logo_path = "/home/sbn/souradip/geo-servers/Indian_Space_Research_Organisation_Logo.svg.png"
@@ -583,7 +634,6 @@ def stack_layers():
     finally:
         if 'temp_dir' in locals():
             shutil.rmtree(temp_dir, ignore_errors=True)
-            
 @app.route("/generate-gif", methods=["POST"])
 @swag_from({
     'tags': ['GIF Generation'],
@@ -1092,7 +1142,7 @@ def generate_gif_endpoint():
                     band_name = ", ".join(band_name)
                 
                 # Add file information
-                file_info = f"Satellite: {input_data['SatelliteId']} | Product: {input_data['productType']} | Band: {band_name}"
+                file_info = f"Satellite: {input_data['SatelliteId']} | Product: {input_data['productType']}"
                 
                 # Draw text for datetime and file info (on the left side)
                 draw.text((10, 10), datetime_str, fill=(0, 0, 0, 255), font=font)
