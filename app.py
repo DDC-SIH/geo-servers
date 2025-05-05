@@ -196,7 +196,212 @@ def download_from_titiler(url, output_path):
     else:
         raise Exception(f"Failed to download {url}")
 
-@app.route('/download/raw', methods=['POST'])
+# Add these imports at the top of the file
+import geopandas as gpd
+import matplotlib.pyplot as plt
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
+import matplotlib.patches as mpatches
+import os.path
+from rasterio.warp import transform_bounds
+from rasterio.crs import CRS
+
+# Add this function after existing imports
+import shapely.ops  # Add this import if not already present
+
+def overlay_shapefile(img, transform, crs, show_country=True, show_states=True, line_width=1.0):
+    """
+    Overlay shapefile boundaries on an image with improved visibility
+    
+    Args:
+        img: PIL Image to overlay boundaries on
+        transform: rasterio transform of the image
+        crs: coordinate reference system of the image
+        show_country: whether to show country boundary
+        show_states: whether to show state boundaries
+        line_width: width of boundary lines
+        
+    Returns:
+        PIL Image with shapefile boundaries overlaid
+    """
+    try:
+        # Get image dimensions
+        width, height = img.size
+        
+        # Create a transparent overlay image first
+        overlay = Image.new('RGBA', (width, height), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(overlay)
+        
+        # Load country boundary shapefile
+        country_path = "/home/sbn/souradip/geo-servers/India_Country_Boundary.shp"
+        state_path = "/home/sbn/souradip/geo-servers/India_State_Boundary.shp"
+        
+        # Ensure CRS is defined
+        if crs is None:
+            print("Warning: CRS is None, defaulting to EPSG:4326")
+            crs = CRS.from_epsg(4326)
+        
+        # Draw country boundary
+        if show_country and os.path.exists(country_path):
+            try:
+                country_gdf = gpd.read_file(country_path)
+                
+                # Ensure the shapefile has a CRS set
+                if country_gdf.crs is None:
+                    print("Setting CRS for country shapefile to EPSG:4326")
+                    country_gdf.set_crs(epsg=4326, inplace=True)
+                
+                # Reproject to the image CRS if needed
+                if country_gdf.crs != crs:
+                    try:
+                        country_gdf = country_gdf.to_crs(crs)
+                    except Exception as e:
+                        print(f"Error reprojecting country boundary: {e}")
+                        # Try using pyproj directly
+                        from pyproj import Transformer
+                        transformer = Transformer.from_crs(country_gdf.crs, crs, always_xy=True)
+                        
+                        def transform_geom(geom):
+                            if geom is None or not geom.is_valid:
+                                return None
+                            return shapely.ops.transform(
+                                lambda x, y: transformer.transform(x, y), 
+                                geom
+                            )
+                        
+                        country_gdf['geometry'] = country_gdf['geometry'].apply(transform_geom)
+                        country_gdf = country_gdf[country_gdf.geometry.notnull()]
+                        if len(country_gdf) > 0:
+                            country_gdf.set_crs(crs, inplace=True)
+                
+                # Directly draw each polygon's exterior on our overlay using PIL
+                for _, row in country_gdf.iterrows():
+                    geom = row['geometry']
+                    if geom is None or not hasattr(geom, 'exterior'):
+                        continue
+                        
+                    # Get the exterior coordinates of the polygon
+                    if hasattr(geom, 'geoms'):  # MultiPolygon
+                        for subgeom in geom.geoms:
+                            if not hasattr(subgeom, 'exterior'):
+                                continue
+                            coords = subgeom.exterior.coords
+                            pixel_coords = [~transform * (x, y) for x, y in coords]
+                            # Draw with thicker blue line for country boundary
+                            draw.line(pixel_coords, fill=(0, 0, 255, 255), width=int(line_width*3))
+                    else:  # Single Polygon
+                        coords = geom.exterior.coords
+                        pixel_coords = [~transform * (x, y) for x, y in coords]
+                        # Draw with thicker blue line for country boundary
+                        draw.line(pixel_coords, fill=(0, 0, 255, 255), width=int(line_width*3))
+                
+            except Exception as e:
+                print(f"Error plotting country boundary: {e}")
+        
+        # Draw state boundaries
+        if show_states and os.path.exists(state_path):
+            try:
+                state_gdf = gpd.read_file(state_path)
+                
+                # Ensure the shapefile has a CRS set
+                if state_gdf.crs is None:
+                    print("Setting CRS for state shapefile to EPSG:4326")
+                    state_gdf.set_crs(epsg=4326, inplace=True)
+                
+                # Reproject to the image CRS if needed
+                if state_gdf.crs != crs:
+                    try:
+                        state_gdf = state_gdf.to_crs(crs)
+                    except Exception as e:
+                        print(f"Error reprojecting state boundaries: {e}")
+                        # Try using pyproj directly
+                        from pyproj import Transformer
+                        transformer = Transformer.from_crs(state_gdf.crs, crs, always_xy=True)
+                        
+                        def transform_geom(geom):
+                            if geom is None or not geom.is_valid:
+                                return None
+                            return shapely.ops.transform(
+                                lambda x, y: transformer.transform(x, y), 
+                                geom
+                            )
+                        
+                        state_gdf['geometry'] = state_gdf['geometry'].apply(transform_geom)
+                        state_gdf = state_gdf[state_gdf.geometry.notnull()]
+                        if len(state_gdf) > 0:
+                            state_gdf.set_crs(crs, inplace=True)
+                
+                # Directly draw each polygon's exterior on our overlay
+                for _, row in state_gdf.iterrows():
+                    geom = row['geometry']
+                    if geom is None or not hasattr(geom, 'exterior'):
+                        continue
+                        
+                    # Get the exterior coordinates of the polygon
+                    if hasattr(geom, 'geoms'):  # MultiPolygon
+                        for subgeom in geom.geoms:
+                            if not hasattr(subgeom, 'exterior'):
+                                continue
+                            coords = subgeom.exterior.coords
+                            pixel_coords = [~transform * (x, y) for x, y in coords]
+                            # Draw with white line for state boundaries (dashed effect)
+                            dash_length = 5  # pixels for dash pattern
+                            for i in range(0, len(pixel_coords)-1, 2):
+                                draw.line([pixel_coords[i], pixel_coords[i+1]], 
+                                          fill=(255, 255, 255, 255), 
+                                          width=int(line_width*2))
+                    else:  # Single Polygon
+                        coords = geom.exterior.coords
+                        pixel_coords = [~transform * (x, y) for x, y in coords]
+                        # Draw with white line for state boundaries (solid for simplicity)
+                        draw.line(pixel_coords, fill=(255, 255, 255, 255), width=int(line_width*2))
+                
+            except Exception as e:
+                print(f"Error plotting state boundaries: {e}")
+        
+        # Add a simple legend to the bottom right
+        if show_country or show_states:
+            legend_width = 150
+            legend_height = 50
+            legend_margin = 10
+            legend_x = width - legend_width - legend_margin
+            legend_y = height - legend_height - legend_margin
+            
+            # Draw semi-transparent white background for legend
+            draw.rectangle([(legend_x, legend_y), 
+                           (legend_x + legend_width, legend_y + legend_height)], 
+                          fill=(255, 255, 255, 180))
+            
+            # Add legend entries
+            if show_country:
+                # Country boundary line
+                draw.line([(legend_x + 10, legend_y + 15), 
+                          (legend_x + 40, legend_y + 15)], 
+                         fill=(0, 0, 255, 255), width=3)
+                # Country label
+                draw.text((legend_x + 50, legend_y + 10), 
+                         "Country", fill=(0, 0, 0, 255))
+            
+            if show_states:
+                # State boundary line
+                draw.line([(legend_x + 10, legend_y + 35), 
+                          (legend_x + 40, legend_y + 35)], 
+                         fill=(255, 255, 255, 255), width=2)
+                # State label
+                draw.text((legend_x + 50, legend_y + 30), 
+                         "States", fill=(0, 0, 0, 255))
+        
+        # Composite the original image with our overlay
+        result_img = Image.alpha_composite(img.convert("RGBA"), overlay)
+        
+        return result_img
+    
+    except Exception as e:
+        print(f"Error in overlay_shapefile: {e}")
+        import traceback
+        traceback.print_exc()
+        # Return the original image if overlay fails
+        return img
 @swag_from({
     'tags': ['Download'],
     'description': 'Download multiple raster layers from direct TiTiler URLs and zip them.',
@@ -245,6 +450,10 @@ def download_raw_layers():
             try:
                 # Open the downloaded image
                 with rasterio.open(path) as src:
+                    # Get transform and CRS for shapefile overlay
+                    transform = src.transform
+                    crs = src.crs
+                    
                     # Read image data
                     if src.count >= 3:
                         img_data = src.read([1, 2, 3])
@@ -331,6 +540,21 @@ def download_raw_layers():
                         except Exception as e:
                             print(f"Error loading ISRO logo: {e}")
                     
+                    # Apply shapefile overlay to the image portion only (below the header)
+                    try:
+                        img_with_overlay = overlay_shapefile(
+                            img, 
+                            transform, 
+                            crs,
+                            show_country=True,
+                            show_states=True
+                        )
+                        
+                        # Replace the image portion in the canvas with the overlaid image
+                        canvas.paste(img_with_overlay, (0, 100))
+                    except Exception as e:
+                        print(f"Error applying shapefile overlay: {e}")
+                    
                     # Save the enhanced image
                     enhanced_path = os.path.join(temp_dir, f"layer_{index}.tiff")
                     canvas.save(enhanced_path, format="TIFF")
@@ -359,6 +583,7 @@ def download_raw_layers():
         if 'temp_dir' in locals():
             shutil.rmtree(temp_dir, ignore_errors=True)
 
+# Now modify the stack_layers function to include shapefile overlay
 @app.route('/download/layered', methods=['POST'])
 @swag_from({
     'tags': ['Download'],
@@ -544,6 +769,10 @@ def stack_layers():
                 # Load the stacked image
                 if output_format in ["tiff", "tif"]:
                     with rasterio.open(stacked_path) as src:
+                        # Get transform and CRS for shapefile overlay
+                        img_transform = src.transform
+                        img_crs = src.crs
+                        
                         if src.count >= 3:
                             img_data = src.read([1, 2, 3])
                             img_data = reshape_as_image(img_data)
@@ -557,13 +786,28 @@ def stack_layers():
                         img = Image.fromarray(img_data)
                 else:
                     img = Image.open(stacked_path)
+                    img_transform = ref_transform
+                    img_crs = ref_crs
                 
                 # Get image dimensions
                 img_width, img_height = img.size
                 
+                # Apply shapefile overlay before adding header
+                try:
+                    img_with_overlay = overlay_shapefile(
+                        img, 
+                        img_transform, 
+                        img_crs,
+                        show_country=True,
+                        show_states=True
+                    )
+                    img = img_with_overlay
+                except Exception as e:
+                    print(f"Error applying shapefile overlay to stacked image: {e}")
+                
                 # Create a larger canvas with white header
                 canvas = Image.new('RGBA', (img_width, img_height + 100), (255, 255, 255, 255))
-                canvas.paste(img, (0, 100))  # Paste original image below the header
+                canvas.paste(img, (0, 100))  # Paste original image with overlay below the header
                 
                 # Create a drawing context
                 draw = ImageDraw.Draw(canvas)
@@ -582,7 +826,7 @@ def stack_layers():
                 current_datetime = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 
                 # Create product information string
-                product_info = f"Satellite: {satellite_id} | Product: {product_type}"
+                product_info = f"Satellite: {satellite_id} | Product: {product_type} | Band: {band_name}"
                 
                 # Layer information
                 layer_count_info = f"Stacked Image: {len(layers)} layers"
@@ -634,6 +878,7 @@ def stack_layers():
     finally:
         if 'temp_dir' in locals():
             shutil.rmtree(temp_dir, ignore_errors=True)
+
 @app.route("/generate-gif", methods=["POST"])
 @swag_from({
     'tags': ['GIF Generation'],
