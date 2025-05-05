@@ -134,7 +134,7 @@ def generate_titiler_url(cog: dict, input_data: dict) -> str:
         bbox_str = f"{bbox['minx']},{bbox['miny']},{bbox['maxx']},{bbox['maxy']}"
         base_url = f"{TITILER_BASE}/bbox/{bbox_str}.png"
     else:
-        base_url = f"{TITILER_BASE}/preview"
+        base_url = f"{TITILER_BASE}/preview.tif"
 
     # Build query parameters
     params = [f"url={file_path}"]
@@ -1374,77 +1374,140 @@ def generate_gif_endpoint():
             try:
                 # Generate and download the base image from TiTiler
                 titiler_url = generate_titiler_url(cog, input_data)
-                img = download_image(titiler_url)
+                print(f"Downloading image from TiTiler: {titiler_url}")
                 
-                # Get image dimensions
-                img_width, img_height = img.size
+                # Add parameter to ensure TiTiler returns a TIF when retrieving the base image
+                # This ensures we have transform and CRS information for overlaying shapefiles
+                # if '.tif' not in titiler_url:
+                #     # Convert to TIFF URL by replacing extension
+                #     if '.png' in titiler_url:
+                #         titiler_url = titiler_url.replace('.png', '.tif')
+                #     elif '.jpg' in titiler_url or '.jpeg' in titiler_url:
+                #         if '.jpg' in titiler_url:
+                #             titiler_url = titiler_url.replace('.jpg', '.tif')
+                #         else:
+                #             titiler_url = titiler_url.replace('.jpeg', '.tif')
+                #     elif '/preview' in titiler_url:
+                #         # For preview endpoint, add .tif extension
+                #         parts = titiler_url.split('/preview')
+                #         if len(parts) > 1:
+                #             if parts[1].startswith('?'):
+                #                 titiler_url = f"{parts[0]}/preview.tif{parts[1]}"
+                #             else:
+                #                 titiler_url = f"{parts[0]}/preview.tif"
                 
-                # Create a larger canvas to add text and legend
-                # Add 100px at the top for datetime and file info
-                canvas = Image.new('RGBA', (img_width, img_height + 100), (255, 255, 255, 255))
-                canvas.paste(img, (0, 100))  # Paste original image below the header
+                # Download the TIFF format to get transform and CRS
+                response = requests.get(titiler_url, stream=True)
+                print(response)
+                if response.status_code != 200:
+                    print(f"Failed to download image: {response.status_code}")
+                    continue
                 
-                # Create a drawing context
-                draw = ImageDraw.Draw(canvas)
+                # Save the TIFF temporarily
+                temp_tiff = BytesIO(response.content)
                 
-                # Load a font
-                try:
-                    font = ImageFont.truetype("DejaVuSans.ttf", 14)
-                    small_font = ImageFont.truetype("DejaVuSans.ttf", 12)
-                except IOError:
-                    # Fallback to default font
-                    font = ImageFont.load_default()
-                    small_font = ImageFont.load_default()
-                
-                # Format datetime for display
-                datetime_str = convert_epoch_to_datetime(cog["aquisition_datetime"]).strftime("%Y-%m-%d %H:%M:%S UTC")
-                
-                # Format band name correctly whether it's a string or a list
-                band_name = input_data['bandName']
-                if isinstance(band_name, list):
-                    band_name = ", ".join(band_name)
-                
-                # Add file information
-                file_info = f"Satellite: {input_data['SatelliteId']} | Product: {input_data['productType']}"
-                
-                # Draw text for datetime and file info (on the left side)
-                draw.text((10, 10), datetime_str, fill=(0, 0, 0, 255), font=font)
-                draw.text((10, 40), file_info, fill=(0, 0, 0, 255), font=small_font)
-                draw.text((10, 65), f"File: {cog['filename']}", fill=(0, 0, 0, 255), font=small_font)
-                
-                # Add the ISRO logo in the top-right corner of the header
-                if logo_img:
-                    logo_position = (img_width - logo_img.width - 10, 10)  # Top-right position
-                    canvas.paste(logo_img, logo_position, logo_img)
-                
-                # Add legend in the top-middle of the header
-                if legend_img:
-                    # Center horizontally
-                    legend_position_x = (img_width - legend_img.width) // 2
-                    # Place in the middle of the header area
-                    legend_position_y = 50
-                    canvas.paste(legend_img, (legend_position_x, legend_position_y), legend_img)
+                # Open with rasterio to get transform and CRS
+                with rasterio.open(temp_tiff) as src:
+                    transform = src.transform
+                    crs = src.crs
+                    print(f"✅ Got transform and CRS for {cog['filename']}")
+                    # Read image data
+                    if src.count >= 3:
+                        img_data = src.read([1, 2, 3])
+                        img_data = reshape_as_image(img_data)
+                    else:
+                        img_data = src.read(1)
+                        img_data = np.stack([img_data]*3, axis=2)
                     
-                    # Only add min/max labels if not already part of the custom legend
-                    if legend_img.height < 30:  # The custom legend already includes the labels
-                        # Add min/max labels to the legend
-                        draw.text(
-                            (legend_position_x - 30, legend_position_y + 5), 
-                            "Min", 
-                            fill=(0, 0, 0, 255), 
-                            font=small_font
-                        )
-                        draw.text(
-                            (legend_position_x + legend_img.width + 5, legend_position_y + 5), 
-                            "Max", 
-                            fill=(0, 0, 0, 255), 
-                            font=small_font
-                        )
+                    # Convert to 8-bit if needed
+                    if img_data.dtype != np.uint8:
+                        img_data = ((img_data / img_data.max()) * 255).astype(np.uint8)
+                    
+                    # Convert to PIL image for further processing
+                    img = Image.fromarray(img_data)
+                    print(crs)
+                    # Apply overlay_shapefile to add country and state boundaries
+                    img_with_boundaries = overlay_shapefile(
+                        img,  # Ensure image is RGBA
+                        transform,
+                        crs,
+                        show_country=True,
+                        show_states=True,
+                        line_width=1.0
+                    )
+                    
+                    # Now that we have the image with boundaries, create the header
+                    img_width, img_height = img_with_boundaries.size
+                    
+                    # Create a larger canvas to add text and legend
+                    # Add 100px at the top for datetime and file info
+                    canvas = Image.new('RGBA', (img_width, img_height + 100), (255, 255, 255, 255))
+                    canvas.paste(img_with_boundaries, (0, 100))  # Paste image with boundaries below the header
+                    
+                    # Create a drawing context
+                    draw = ImageDraw.Draw(canvas)
+                    
+                    # Load a font
+                    try:
+                        font = ImageFont.truetype("DejaVuSans.ttf", 14)
+                        small_font = ImageFont.truetype("DejaVuSans.ttf", 12)
+                    except IOError:
+                        # Fallback to default font
+                        font = ImageFont.load_default()
+                        small_font = ImageFont.load_default()
+                    
+                    # Format datetime for display
+                    datetime_str = convert_epoch_to_datetime(cog["aquisition_datetime"]).strftime("%Y-%m-%d %H:%M:%S UTC")
+                    
+                    # Format band name correctly whether it's a string or a list
+                    band_name = input_data['bandName']
+                    if isinstance(band_name, list):
+                        band_name = ", ".join(band_name)
+                    
+                    # Add file information
+                    file_info = f"Satellite: {input_data['SatelliteId']} | Product: {input_data['productType']}"
+                    
+                    # Draw text for datetime and file info (on the left side)
+                    draw.text((10, 10), datetime_str, fill=(0, 0, 0, 255), font=font)
+                    draw.text((10, 40), file_info, fill=(0, 0, 0, 255), font=small_font)
+                    draw.text((10, 65), f"File: {cog['filename']}", fill=(0, 0, 0, 255), font=small_font)
+                    
+                    # Add the ISRO logo in the top-right corner of the header
+                    if logo_img:
+                        logo_position = (img_width - logo_img.width - 10, 10)  # Top-right position
+                        canvas.paste(logo_img, logo_position, logo_img)
+                    
+                    # Add legend in the top-middle of the header
+                    if legend_img:
+                        # Center horizontally
+                        legend_position_x = (img_width - legend_img.width) // 2
+                        # Place in the middle of the header area
+                        legend_position_y = 50
+                        canvas.paste(legend_img, (legend_position_x, legend_position_y), legend_img)
+                        
+                        # Only add min/max labels if not already part of the custom legend
+                        if legend_img.height < 30:  # The custom legend already includes the labels
+                            # Add min/max labels to the legend
+                            draw.text(
+                                (legend_position_x - 30, legend_position_y + 5), 
+                                "Min", 
+                                fill=(0, 0, 0, 255), 
+                                font=small_font
+                            )
+                            draw.text(
+                                (legend_position_x + legend_img.width + 5, legend_position_y + 5), 
+                                "Max", 
+                                fill=(0, 0, 0, 255), 
+                                font=small_font
+                            )
+                    
+                    enhanced_images.append(canvas)
+                    print(f"✅ Added enhanced image with country/state boundaries from {cog['filename']} to GIF")
                 
-                enhanced_images.append(canvas)
-                print(f"✅ Added enhanced image from {cog['filename']} to GIF")
             except Exception as img_err:
                 print(f"❌ Error processing image for {cog['filename']}: {img_err}")
+                import traceback
+                traceback.print_exc()
         
         # Build the GIF with the enhanced images
         if not enhanced_images:
@@ -1470,6 +1533,8 @@ def generate_gif_endpoint():
         return send_file(gif_buffer, mimetype="image/gif", download_name="output.gif")
     except Exception as e:
         print(f"❌ Error in generate_gif_endpoint: {e}")
+        import traceback
+        traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
 @app.route("/pointprobe", methods=["POST"])
